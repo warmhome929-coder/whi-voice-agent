@@ -1,5 +1,5 @@
 /**
- * WHI Homes - Hybrid Voice Agent v4 (UPDATED)
+ * WHI Homes - Hybrid Voice Agent v4 
  * Tarping: 100% Autonomous + 8 Services: Basic Routing
  * 
  * IMPROVEMENTS:
