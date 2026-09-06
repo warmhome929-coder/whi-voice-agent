@@ -2,7 +2,7 @@
   "name": "giving-life-to-aurora",
   "version": "1.0.0",
   "description": "",
-  "main": "aurora-deployment-config.js",
+  "main": "aurora-main-agent.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
