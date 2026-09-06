@@ -40,7 +40,7 @@ const AURORA_CONFIG = {
   // Claude API Configuration
   claude: {
     apiKey: process.env.CLAUDE_API_KEY,
-    model: 'claude-opus-4-1',
+    model: 'claude-3-5-sonnet-20241022',
     maxTokens: 1024
   },
 
