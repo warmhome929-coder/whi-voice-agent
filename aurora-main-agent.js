@@ -187,7 +187,7 @@ class AuroraAgent {
 
       return assistantMessage;
     } catch (error) {
-      console.error('Claude API Error:', error);
+      console.error('Claude error details:', error.message, error.response);\n      console.error('Claude API Error:, error);
       return "I apologize, I'm having trouble processing your request. Could you please try again?";
     }
   }
@@ -512,3 +512,4 @@ app.listen(PORT, () => {
 });
 
 module.exports = { AuroraAgent, app };
+
