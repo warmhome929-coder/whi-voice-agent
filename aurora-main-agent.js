@@ -467,7 +467,7 @@ exports.handleGatherResponse = async (req, res) => {
         input: 'speech',
         action: '/voice/gather-response'
       });
-      gather.play(audioUrl);
+      gather.say(result.response, { voice: 'woman' });
     }
 
     res.type('text/xml');
