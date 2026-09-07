@@ -12,7 +12,7 @@ class AuroraAgent {
       const response = await axios.post(
         'https://api.anthropic.com/v1/messages',
         {
-          model: 'claude-3-5-sonnet-20241022',
+          model: 'claude-3-5-sonnet-latest',
           max_tokens: 1024,
           system: 'You are Aurora, a professional voice assistant for Warm Home Inc. Be helpful and warm.',
           messages: [{ role: 'user', content: message }]
