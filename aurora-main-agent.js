@@ -4,7 +4,6 @@
  * Handles: Call greeting, data collection, routing, CRM integration
  * 
  * Technology: Node.js + Twilio + ElevenLabs + Claude API + Supabase
- * UPDATED: September 8, 2026 - Claude Sonnet 5 Migration
  */
 
 const twilio = require('twilio');
@@ -240,24 +239,26 @@ class AuroraAgent {
     const extractionPrompt = `Extract the following information from this customer message. Return as JSON with null for missing fields:
     {
       "name": "customer's name",
-      "phone": "phone number",
-      "email": "email if provided",
-      "serviceType": "roofing, tarping, tree removal, exterior, interior, waterproofing, armor plating, new build, or millwork",
-      "urgencyLevel": "EMERGENCY, URGENT, or ROUTINE",
-      "description": "what they need",
-      "address": "property address if mentioned"
+      "phone": "phone number format: XXX-XXX-XXXX",
+      "email": "email address",
+      "serviceType": "which service: roofing/tarping/tree/exterior/interior/waterproofing/armor/newbuild/millwork",
+      "urgencyLevel": "EMERGENCY/URGENT/ROUTINE based on description",
+      "description": "brief description of the issue",
+      "address": "property address"
     }
-    
+
     Customer message: "${userMessage}"
-    
+
     Return ONLY valid JSON, no other text.`;
 
     try {
       const response = await axios.post('https://api.anthropic.com/v1/messages', {
         model: this.config.claude.model,
-        max_tokens: 300,
-        system: 'You are a data extraction assistant. Extract customer information and return ONLY valid JSON.',
-        messages: [{ role: 'user', content: extractionPrompt }]
+        max_tokens: 500,
+        messages: [{
+          role: 'user',
+          content: extractionPrompt
+        }]
       }, {
         headers: {
           'x-api-key': this.config.claude.apiKey,
@@ -265,8 +266,8 @@ class AuroraAgent {
         }
       });
 
-      const extractedText = response.data.content[0].text;
-      const extracted = JSON.parse(extractedText);
+      const jsonText = response.data.content[0].text;
+      const extracted = JSON.parse(jsonText);
 
       // Update collected data
       if (extracted.name) this.collectedData.callerName = extracted.name;
@@ -405,35 +406,45 @@ class AuroraAgent {
 
 exports.handleCall = async (req, res) => {
   console.log('🎤 TWILIO WEBHOOK HIT - Incoming call received!');
-
-  const twiml = new twilio.twiml.VoiceResponse();
+  
   const agent = new AuroraAgent();
+  const twiml = new twilio.twiml.VoiceResponse();
 
   try {
-    // Play greeting
+    // CRITICAL: Send TwiML response IMMEDIATELY to Twilio
+    // Do NOT wait for ElevenLabs or any async operations!
+    
     const greeting = agent.getGreetingScript();
-    const audioBuffer = await agent.textToSpeech(greeting);
+    console.log('📝 Greeting:', greeting);
     
-    // Convert buffer to base64 URL-safe audio
-    const audioBase64 = audioBuffer.toString('base64');
-    const audioUrl = `data:audio/mpeg;base64,${audioBase64}`;
-    
-    // Play and gather user response
+    // Use Twilio's built-in say() method instead of waiting for ElevenLabs
+    // This sends the TwiML response back to Twilio immediately
     const gather = twiml.gather({
-      numDigits: 0, // Accept any input
+      numDigits: 0,
       timeout: 30,
       speechTimeout: 'auto',
       input: 'speech',
       action: '/voice/gather-response'
     });
 
-    // Play greeting inside gather
-    gather.play(audioUrl);
+    // Use Twilio's native say() instead of playing base64 audio
+    gather.say(greeting, {
+      voice: 'woman'
+    });
 
+    console.log('✅ Sending TwiML response to Twilio');
     res.type('text/xml');
     res.send(twiml.toString());
+    
+    // Generate ElevenLabs audio in background (doesn't block response)
+    agent.textToSpeech(greeting).then((audioBuffer) => {
+      console.log('✅ ElevenLabs audio generated successfully');
+    }).catch((error) => {
+      console.error('❌ ElevenLabs error:', error);
+    });
+
   } catch (error) {
-    console.error('Call handling error:', error);
+    console.error('❌ Call handling error:', error);
     twiml.say("We're experiencing technical difficulties. Please try again later.");
     res.type('text/xml');
     res.send(twiml.toString());
@@ -509,7 +520,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🎤 Aurora Voice Agent running on port ${PORT}`);
   console.log(`📱 Ready to receive calls on all 8 phone numbers`);
-  console.log(`🤖 Using Claude Sonnet 5 + ElevenLabs voice`);
+  console.log(`🤖 Using Claude API + ElevenLabs voice`);
 });
 
 module.exports = { AuroraAgent, app };
