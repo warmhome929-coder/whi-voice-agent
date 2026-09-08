@@ -51,9 +51,12 @@ const AURORA_CONFIG = {
       apiKey: process.env.ELEVENLABS_API_KEY,
       voiceId: 'EXAVITQu4vr4xnSDxMaL', // Bella - professional, confident, natural
       modelId: 'eleven_turbo_v2_5',
-      stability: 0.35, // lower = more expressive/emotive delivery, less flat and clipped
+      // v6 tried stability 0.35 + speed 0.92 together to fix "too fast/flat" -
+      // that combo made her sound slurred and sleepy instead. Reverting
+      // stability to the reliable original value and only barely touching speed.
+      stability: 0.5,
       similarityBoost: 0.75,
-      speed: 0.92, // slightly slower than default (1.0) - she was coming across as rushed, especially in the greeting
+      speed: 0.97,
       timeoutMs: 2500 // give up and use Twilio's voice if ElevenLabs is slower than this
     },
     twilioFallback: {
@@ -574,7 +577,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '7.0.0',
+    version: '8.0.0',
     timestamp: new Date().toISOString()
   });
 });
