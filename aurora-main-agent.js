@@ -4,6 +4,7 @@
  * Handles: Call greeting, data collection, routing, CRM integration
  * 
  * Technology: Node.js + Twilio + ElevenLabs + Claude API + Supabase
+ * UPDATED: September 8, 2026 - Claude Sonnet 5 Migration
  */
 
 const twilio = require('twilio');
@@ -39,8 +40,8 @@ const AURORA_CONFIG = {
 
   // Claude API Configuration
   claude: {
-    apiKey: process.env.CLAUDE_API_KEY,
-    model: 'claude-3-5-sonnet-20241022',
+    apiKey: process.env.ANTHROPIC_API_KEY,
+    model: 'claude-sonnet-5',
     maxTokens: 1024
   },
 
@@ -239,35 +240,33 @@ class AuroraAgent {
     const extractionPrompt = `Extract the following information from this customer message. Return as JSON with null for missing fields:
     {
       "name": "customer's name",
-      "phone": "phone number format: XXX-XXX-XXXX",
-      "email": "email address",
-      "serviceType": "which service: roofing/tarping/tree/exterior/interior/waterproofing/armor/newbuild/millwork",
-      "urgencyLevel": "EMERGENCY/URGENT/ROUTINE based on description",
-      "description": "brief description of the issue",
-      "address": "property address"
+      "phone": "phone number",
+      "email": "email if provided",
+      "serviceType": "roofing, tarping, tree removal, exterior, interior, waterproofing, armor plating, new build, or millwork",
+      "urgencyLevel": "EMERGENCY, URGENT, or ROUTINE",
+      "description": "what they need",
+      "address": "property address if mentioned"
     }
-
+    
     Customer message: "${userMessage}"
-
+    
     Return ONLY valid JSON, no other text.`;
 
     try {
       const response = await axios.post('https://api.anthropic.com/v1/messages', {
         model: this.config.claude.model,
-        max_tokens: 500,
-        messages: [{
-          role: 'user',
-          content: extractionPrompt
-        }]
+        max_tokens: 300,
+        system: 'You are a data extraction assistant. Extract customer information and return ONLY valid JSON.',
+        messages: [{ role: 'user', content: extractionPrompt }]
       }, {
         headers: {
           'x-api-key': this.config.claude.apiKey,
-          'anthropic-version': '2023-06-01'
+          'anthropic-version': '2023-12-01'
         }
       });
 
-      const jsonText = response.data.content[0].text;
-      const extracted = JSON.parse(jsonText);
+      const extractedText = response.data.content[0].text;
+      const extracted = JSON.parse(extractedText);
 
       // Update collected data
       if (extracted.name) this.collectedData.callerName = extracted.name;
@@ -411,26 +410,26 @@ exports.handleCall = async (req, res) => {
   try {
     // Play greeting
     const greeting = agent.getGreetingScript();
+    const audioBuffer = await agent.textToSpeech(greeting);
     
-    // Instead of data URL, use Twilio's built-in say for now
-    // (We'll improve this later with hosted audio)
+    // Convert buffer to base64 URL-safe audio
+    const audioBase64 = audioBuffer.toString('base64');
+    const audioUrl = `data:audio/mpeg;base64,${audioBase64}`;
     
     // Play and gather user response
     const gather = twiml.gather({
-      numDigits: 0,
+      numDigits: 0, // Accept any input
       timeout: 30,
       speechTimeout: 'auto',
       input: 'speech',
-      action: '/voice/gather-response',
-      hints: 'roofing, tarping, tree removal, water damage, emergency'
+      action: '/voice/gather-response'
     });
-    
-    // Use Twilio's voice for greeting (simpler, more reliable)
-    gather.say(greeting, { voice: 'woman' });
+
+    // Play greeting inside gather
+    gather.play(audioUrl);
 
     res.type('text/xml');
     res.send(twiml.toString());
-   
   } catch (error) {
     console.error('Call handling error:', error);
     twiml.say("We're experiencing technical difficulties. Please try again later.");
@@ -442,44 +441,44 @@ exports.handleCall = async (req, res) => {
 exports.handleGatherResponse = async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const userMessage = req.body.SpeechResult || '';
-  
-  if (!userMessage || userMessage.trim() === '') {
-    const gather = twiml.gather({
-      numDigits: 0,
-      timeout: 30,
-      speechTimeout: 'auto',
-      input: 'speech',
-      action: '/voice/gather-response'
-    });
-    gather.say('Sorry, I did not catch that. Could you please repeat?', { voice: 'woman' });
-    res.type('text/xml');
-    res.send(twiml.toString());
-    return;
-  }
-  
+  const agent = new AuroraAgent();
+
   try {
-    const agent = new AuroraAgent();
+    // Process user message
     const result = await agent.handleConversation(userMessage);
     
-    const gather = twiml.gather({
-      numDigits: 0,
-      timeout: 30,
-      speechTimeout: 'auto',
-      input: 'speech',
-      action: '/voice/gather-response'
-    });
-    
-    gather.say(result.response, { voice: 'woman' });
+    // Generate audio response
+    const responseAudio = await agent.textToSpeech(result.response);
+    const audioBase64 = responseAudio.toString('base64');
+    const audioUrl = `data:audio/mpeg;base64,${audioBase64}`;
+
+    // Check if conversation is complete
+    if (result.status === 'ready_to_route') {
+      twiml.play(audioUrl);
+      twiml.say("Thank you for calling. Goodbye!");
+      twiml.hangup();
+    } else {
+      // Continue gathering
+      const gather = twiml.gather({
+        numDigits: 0,
+        timeout: 30,
+        speechTimeout: 'auto',
+        input: 'speech',
+        action: '/voice/gather-response'
+      });
+      gather.play(audioUrl);
+    }
+
     res.type('text/xml');
     res.send(twiml.toString());
   } catch (error) {
     console.error('Gather response error:', error);
-    twiml.say('We encountered an error. Please call back soon.', { voice: 'woman' });
+    twiml.say("I apologize, I'm having difficulty. Please call back soon.");
+    twiml.hangup();
     res.type('text/xml');
     res.send(twiml.toString());
   }
 };
-    
 
 // ============================================
 // EXPRESS SERVER SETUP
@@ -508,7 +507,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🎤 Aurora Voice Agent running on port ${PORT}`);
   console.log(`📱 Ready to receive calls on all 8 phone numbers`);
-  console.log(`🤖 Using Claude API + ElevenLabs voice`);
+  console.log(`🤖 Using Claude Sonnet 5 + ElevenLabs voice`);
 });
 
 module.exports = { AuroraAgent, app };
