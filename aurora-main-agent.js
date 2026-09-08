@@ -2,8 +2,19 @@
  * AURORA VOICE AGENT - MAIN APPLICATION
  * Complete implementation of Aurora Generalist System
  * Handles: Call greeting, data collection, routing, CRM integration
- * 
+ *
  * Technology: Node.js + Twilio + ElevenLabs + Claude API + Supabase
+ *
+ * FIXED (this version):
+ *  - handleGatherResponse no longer depends on ElevenLabs succeeding.
+ *    Twilio's own voice now speaks every reply reliably; ElevenLabs
+ *    still generates audio in the background (non-blocking, best-effort)
+ *    so nothing breaks if ElevenLabs errors, times out, or 4xx's.
+ *  - Switched Twilio voice from generic 'woman' to 'Polly.Joanna-Neural'
+ *    for clearer, more natural name pronunciation (fixes "Aurora" being
+ *    heard as "Laura").
+ *  - Added a fallback line if Claude ever returns an empty response, so
+ *    Aurora never tries to "say" nothing.
  */
 
 const twilio = require('twilio');
@@ -33,7 +44,10 @@ const AURORA_CONFIG = {
       similarityBoost: 0.75
     },
     twilio: {
-      voice: 'woman' // Fallback
+      // CHANGED: was 'woman' (generic, mispronounces names like "Aurora").
+      // Polly neural voices pronounce names far more reliably.
+      // Other options to try: 'Polly.Kendra-Neural', 'Polly.Salli-Neural'
+      voice: 'Polly.Joanna-Neural'
     }
   },
 
@@ -174,7 +188,7 @@ class AuroraAgent {
       });
 
       const assistantMessage = response.data.content[0].text;
-      
+
       // Add to conversation history
       this.conversationHistory.push({
         role: 'user',
@@ -187,13 +201,19 @@ class AuroraAgent {
 
       return assistantMessage;
     } catch (error) {
-      console.error('Claude API Error:', error);
+      console.error('Claude API Error:', error.response?.data || error.message);
       return "I apologize, I'm having trouble processing your request. Could you please try again?";
     }
   }
 
   // CONVERT TEXT TO SPEECH USING ELEVENLABS
+  // NOTE: This is now used strictly as a best-effort, non-blocking
+  // background call (see handleCall / handleGatherResponse below).
+  // Twilio's own voice is what the caller actually hears.
   async textToSpeech(text) {
+    if (!text || !text.trim()) {
+      throw new Error('textToSpeech called with empty text - skipping ElevenLabs call');
+    }
     try {
       const response = await axios.post(
         `https://api.elevenlabs.io/v1/text-to-speech/${this.config.voice.elevenlabs.voiceId}`,
@@ -216,7 +236,7 @@ class AuroraAgent {
 
       return response.data; // Returns audio buffer
     } catch (error) {
-      console.error('ElevenLabs TTS Error:', error);
+      console.error('ElevenLabs TTS Error:', error.response?.data || error.message);
       throw error;
     }
   }
@@ -266,7 +286,9 @@ class AuroraAgent {
         }
       });
 
-      const jsonText = response.data.content[0].text;
+      let jsonText = response.data.content[0].text;
+      // Claude sometimes wraps JSON in ```json ... ``` fences even when told not to - strip them defensively
+      jsonText = jsonText.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
       const extracted = JSON.parse(jsonText);
 
       // Update collected data
@@ -280,7 +302,7 @@ class AuroraAgent {
 
       return extracted;
     } catch (error) {
-      console.error('Data extraction error:', error);
+      console.error('Data extraction error:', error.response?.data || error.message);
       return {};
     }
   }
@@ -343,7 +365,7 @@ class AuroraAgent {
       console.log('Inquiry saved to Supabase:', response.data);
       return response.data;
     } catch (error) {
-      console.error('Supabase save error:', error);
+      console.error('Supabase save error:', error.response?.data || error.message);
       throw error;
     }
   }
@@ -364,7 +386,7 @@ class AuroraAgent {
 
       console.log('SMS sent successfully');
     } catch (error) {
-      console.error('SMS send error:', error);
+      console.error('SMS send error:', error.response?.data || error.message);
     }
   }
 
@@ -376,15 +398,20 @@ class AuroraAgent {
     // Step 2: Generate Aurora response using Claude
     let response = await this.generateResponse(userMessage);
 
+    // Safety net: never let an empty/undefined response reach the speech layer
+    if (!response || !response.trim()) {
+      response = "I'm sorry, could you say that one more time for me?";
+    }
+
     // Step 3: Check if we have all required data
     if (this.hasRequiredData()) {
       // Step 4: Add closing statement
       response += "\n\nI've gathered all the information I need. Let me confirm what we'll do next: Our team will contact you within the timeframe I mentioned. Thank you for choosing Warm Home Inc!";
-      
+
       // Step 5: Save data and send SMS
       await this.saveInquiryData();
       await this.sendSMSConfirmation();
-      
+
       return {
         response: response,
         status: 'ready_to_route',
@@ -406,17 +433,17 @@ class AuroraAgent {
 
 exports.handleCall = async (req, res) => {
   console.log('🎤 TWILIO WEBHOOK HIT - Incoming call received!');
-  
+
   const agent = new AuroraAgent();
   const twiml = new twilio.twiml.VoiceResponse();
 
   try {
     // CRITICAL: Send TwiML response IMMEDIATELY to Twilio
     // Do NOT wait for ElevenLabs or any async operations!
-    
+
     const greeting = agent.getGreetingScript();
     console.log('📝 Greeting:', greeting);
-    
+
     // Use Twilio's built-in say() method instead of waiting for ElevenLabs
     // This sends the TwiML response back to Twilio immediately
     const gather = twiml.gather({
@@ -429,18 +456,18 @@ exports.handleCall = async (req, res) => {
 
     // Use Twilio's native say() instead of playing base64 audio
     gather.say(greeting, {
-      voice: 'woman'
+      voice: agent.config.voice.twilio.voice
     });
 
     console.log('✅ Sending TwiML response to Twilio');
     res.type('text/xml');
     res.send(twiml.toString());
-    
-    // Generate ElevenLabs audio in background (doesn't block response)
+
+    // Generate ElevenLabs audio in background (doesn't block response, doesn't matter if it fails)
     agent.textToSpeech(greeting).then((audioBuffer) => {
-      console.log('✅ ElevenLabs audio generated successfully');
+      console.log('✅ ElevenLabs audio generated successfully (background)');
     }).catch((error) => {
-      console.error('❌ ElevenLabs error:', error);
+      console.error('❌ ElevenLabs error (background, non-fatal):', error.message);
     });
 
   } catch (error) {
@@ -457,18 +484,20 @@ exports.handleGatherResponse = async (req, res) => {
   const agent = new AuroraAgent();
 
   try {
-    // Process user message
+    // Process user message (Claude conversation + data extraction)
     const result = await agent.handleConversation(userMessage);
-    
-    // Generate audio response
-    const responseAudio = await agent.textToSpeech(result.response);
-    const audioBase64 = responseAudio.toString('base64');
-    const audioUrl = `data:audio/mpeg;base64,${audioBase64}`;
 
-    // Check if conversation is complete
+    // FIX: Speak the reply using Twilio's own voice immediately and
+    // reliably - do NOT depend on ElevenLabs succeeding to respond to
+    // the caller. This is the same resilient pattern already used for
+    // the greeting in handleCall above.
+    const spokenText = (result && result.response && result.response.trim())
+      ? result.response
+      : "I'm sorry, could you say that one more time for me?";
+
     if (result.status === 'ready_to_route') {
-      twiml.play(audioUrl);
-      twiml.say("Thank you for calling. Goodbye!");
+      twiml.say(spokenText, { voice: agent.config.voice.twilio.voice });
+      twiml.say("Thank you for calling. Goodbye!", { voice: agent.config.voice.twilio.voice });
       twiml.hangup();
     } else {
       // Continue gathering
@@ -479,14 +508,25 @@ exports.handleGatherResponse = async (req, res) => {
         input: 'speech',
         action: '/voice/gather-response'
       });
-      gather.play(audioUrl);
+      gather.say(spokenText, { voice: agent.config.voice.twilio.voice });
     }
 
+    console.log('✅ Sending TwiML gather-response to Twilio');
     res.type('text/xml');
     res.send(twiml.toString());
+
+    // Generate ElevenLabs audio in the background purely for future use
+    // (e.g. once it's hosted at a real URL instead of inline). Never
+    // blocks the caller and can never break the call.
+    agent.textToSpeech(spokenText).then(() => {
+      console.log('✅ ElevenLabs audio generated successfully (background)');
+    }).catch((error) => {
+      console.error('❌ ElevenLabs error (background, non-fatal):', error.message);
+    });
+
   } catch (error) {
-    console.error('Gather response error:', error);
-    twiml.say("I apologize, I'm having difficulty. Please call back soon.");
+    console.error('❌ Gather response error:', error);
+    twiml.say("I apologize, I'm having difficulty. Please call back soon.", { voice: 'Polly.Joanna-Neural' });
     twiml.hangup();
     res.type('text/xml');
     res.send(twiml.toString());
