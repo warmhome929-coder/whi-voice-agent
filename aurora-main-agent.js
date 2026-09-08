@@ -404,6 +404,8 @@ class AuroraAgent {
 // ============================================
 
 exports.handleCall = async (req, res) => {
+  console.log('🎤 TWILIO WEBHOOK HIT - Incoming call received!');
+
   const twiml = new twilio.twiml.VoiceResponse();
   const agent = new AuroraAgent();
 
