@@ -53,6 +53,7 @@ const AURORA_CONFIG = {
       modelId: 'eleven_turbo_v2_5',
       stability: 0.35, // lower = more expressive/emotive delivery, less flat and clipped
       similarityBoost: 0.75,
+      speed: 0.92, // slightly slower than default (1.0) - she was coming across as rushed, especially in the greeting
       timeoutMs: 2500 // give up and use Twilio's voice if ElevenLabs is slower than this
     },
     twilioFallback: {
@@ -243,7 +244,9 @@ async function speak(twimlNode, agent, text, req) {
     const audioBuffer = await withTimeout(agent.textToSpeech(cleanText), elevenConfig.timeoutMs);
     const id = storeAudioClip(audioBuffer);
     const url = buildAudioUrl(req, id);
-    twimlNode.pause({ length: 1 });
+    // No pause here: this plays a pre-rendered audio file, not a live
+    // TTS engine starting up, so there's no onset-clipping risk to guard
+    // against - and the pause was costing a full second every turn.
     twimlNode.play(url);
     console.log('✅ Speaking via ElevenLabs:', url);
   } catch (error) {
@@ -359,7 +362,8 @@ class AuroraAgent {
         model_id: this.config.voice.elevenlabs.modelId,
         voice_settings: {
           stability: this.config.voice.elevenlabs.stability,
-          similarity_boost: this.config.voice.elevenlabs.similarityBoost
+          similarity_boost: this.config.voice.elevenlabs.similarityBoost,
+          speed: this.config.voice.elevenlabs.speed
         }
       },
       {
@@ -570,7 +574,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '6.0.0',
+    version: '7.0.0',
     timestamp: new Date().toISOString()
   });
 });
