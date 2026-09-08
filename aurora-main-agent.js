@@ -16,6 +16,15 @@
  *  - Shorter ElevenLabs wait (2.5s instead of 3.5s) before falling
  *    back to the Twilio voice, so a slow ElevenLabs response can't
  *    stack extra delay on top of the Claude call.
+ *
+ * v5 FIX (the actual root cause of "I'm having trouble processing your
+ * request" on every single turn): the code assumed Claude's reply was
+ * always the FIRST item in the response's content array. But Claude
+ * Sonnet 5 sometimes returns a "thinking" block before the real text
+ * reply, which pushed the actual answer to a different position -
+ * content[0].text was then undefined, and .trim() on undefined crashed
+ * every time. Now the code searches the content array for the actual
+ * text block instead of assuming it's first.
  *  - (carried over) Real ElevenLabs voice hosted at a real URL, Twilio
  *    fallback if it's slow/fails, call memory across the whole call,
  *    no spoken-aloud emoji, short natural phone-style replies, brief
@@ -288,7 +297,18 @@ class AuroraAgent {
         }
       });
 
-      let raw = response.data.content[0].text.trim();
+      // Don't assume the reply is content[0] - Claude sometimes puts a
+      // "thinking" block first. Find the actual text block instead.
+      const textBlock = Array.isArray(response.data.content)
+        ? response.data.content.find(block => block && block.type === 'text' && typeof block.text === 'string')
+        : null;
+      if (!textBlock) {
+        const blockTypes = Array.isArray(response.data.content)
+          ? response.data.content.map(b => b && b.type).join(', ')
+          : typeof response.data.content;
+        throw new Error(`No text block found in Claude response (block types: [${blockTypes}])`);
+      }
+      let raw = textBlock.text.trim();
       raw = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
 
       let parsed;
@@ -548,7 +568,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '4.0.0',
+    version: '5.0.0',
     timestamp: new Date().toISOString()
   });
 });
