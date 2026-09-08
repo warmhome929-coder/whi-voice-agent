@@ -5,16 +5,19 @@
  *
  * Technology: Node.js + Twilio + ElevenLabs + Claude API + Supabase
  *
- * FIXED (this version):
- *  - handleGatherResponse no longer depends on ElevenLabs succeeding.
- *    Twilio's own voice now speaks every reply reliably; ElevenLabs
- *    still generates audio in the background (non-blocking, best-effort)
- *    so nothing breaks if ElevenLabs errors, times out, or 4xx's.
- *  - Switched Twilio voice from generic 'woman' to 'Polly.Joanna-Neural'
- *    for clearer, more natural name pronunciation (fixes "Aurora" being
- *    heard as "Laura").
- *  - Added a fallback line if Claude ever returns an empty response, so
- *    Aurora never tries to "say" nothing.
+ * FIXES IN THIS VERSION (v2):
+ *  - CALL MEMORY: Aurora now remembers the conversation for the whole
+ *    call (keyed by Twilio's CallSid) instead of starting fresh and
+ *    forgetting everything on every single sentence.
+ *  - NO SPOKEN EMOJI: Claude is told this is a phone call and to never
+ *    use emoji/markdown, and a safety-net strips any that slip through
+ *    before anything is spoken.
+ *  - SHORTER, TIGHTER REPLIES: system prompt now tells Claude to talk
+ *    like a real phone agent - warm but brief - instead of long, gushing
+ *    paragraphs.
+ *  - (carried over from v1) Twilio's own voice speaks every reply
+ *    reliably; ElevenLabs only ever runs as a non-blocking background
+ *    call and can never break the conversation if it fails.
  */
 
 const twilio = require('twilio');
@@ -44,8 +47,7 @@ const AURORA_CONFIG = {
       similarityBoost: 0.75
     },
     twilio: {
-      // CHANGED: was 'woman' (generic, mispronounces names like "Aurora").
-      // Polly neural voices pronounce names far more reliably.
+      // Polly neural voice pronounces names ("Aurora") far more reliably than the generic 'woman' voice.
       // Other options to try: 'Polly.Kendra-Neural', 'Polly.Salli-Neural'
       voice: 'Polly.Joanna-Neural'
     }
@@ -55,7 +57,7 @@ const AURORA_CONFIG = {
   claude: {
     apiKey: process.env.ANTHROPIC_API_KEY,
     model: 'claude-sonnet-5',
-    maxTokens: 1024
+    maxTokens: 300 // Keep phone replies short - long responses feel unnatural spoken aloud
   },
 
   // Supabase Configuration
@@ -75,6 +77,7 @@ const AURORA_CONFIG = {
 
 // ============================================
 // AURORA SYSTEM PROMPT - YOUR EXACT SPECIFICATION
+// (+ voice-call ground rules added at the end)
 // ============================================
 
 const AURORA_SYSTEM_PROMPT = `You are Aurora, a professional, warm, and articulate digital assistant for Warm Home Inc. Your role is to be adaptable, helpful, and ready to assist with a wide variety of inquiries, information gathering, or administrative tasks for the company as a whole, always maintaining a warm and empathetic tone.
@@ -138,7 +141,50 @@ YOUR PRIMARY GOAL IN THIS CALL:
 5. Collect required information: name, phone, email (if given), service type, description, address
 6. Explain next steps clearly so they feel informed
 7. Confirm they understand and feel confident in Warm Home Inc.
-8. End call by saving their data and routing to appropriate team`;
+8. End call by saving their data and routing to appropriate team
+
+CRITICAL - THIS IS A LIVE PHONE CALL, NOT A CHAT WINDOW:
+- Everything you write is read aloud by a text-to-speech voice. The caller cannot see text.
+- NEVER use emoji, emoticons, asterisks, markdown formatting, bullet points, numbered lists, or any symbols - say things in plain, natural spoken sentences only.
+- Keep every reply SHORT: 1-3 sentences per turn. Ask one question at a time. Real phone agents don't give long speeches - they have a brief, natural back-and-forth.
+- Be warm but efficient - skip long compliments or gushing reactions to small talk. A brief, genuine acknowledgment is enough, then move the conversation forward.`;
+
+// ============================================
+// SPEECH SANITIZATION - strip anything that
+// would sound wrong or get read aloud literally
+// ============================================
+
+function sanitizeForSpeech(text) {
+  if (!text) return text;
+  return text
+    // Strip common emoji / pictograph ranges
+    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{FE0F}]/gu, '')
+    // Strip markdown symbols that sometimes leak through
+    .replace(/[*_#`~]/g, '')
+    // Collapse extra whitespace left behind
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+// ============================================
+// PER-CALL SESSION MEMORY
+// Keyed by Twilio's CallSid so Aurora remembers
+// the conversation from pickup to hangup, instead
+// of starting fresh on every single sentence.
+// ============================================
+
+const activeCalls = new Map();
+
+function getOrCreateAgent(callSid) {
+  if (!activeCalls.has(callSid)) {
+    activeCalls.set(callSid, new AuroraAgent());
+  }
+  return activeCalls.get(callSid);
+}
+
+function endCallSession(callSid) {
+  activeCalls.delete(callSid);
+}
 
 // ============================================
 // AURORA GREETING & CONVERSATION MANAGEMENT
@@ -187,9 +233,10 @@ class AuroraAgent {
         }
       });
 
-      const assistantMessage = response.data.content[0].text;
+      let assistantMessage = response.data.content[0].text;
+      assistantMessage = sanitizeForSpeech(assistantMessage);
 
-      // Add to conversation history
+      // Add to conversation history (this call's memory)
       this.conversationHistory.push({
         role: 'user',
         content: userMessage
@@ -208,8 +255,7 @@ class AuroraAgent {
 
   // CONVERT TEXT TO SPEECH USING ELEVENLABS
   // NOTE: This is now used strictly as a best-effort, non-blocking
-  // background call (see handleCall / handleGatherResponse below).
-  // Twilio's own voice is what the caller actually hears.
+  // background call. Twilio's own voice is what the caller actually hears.
   async textToSpeech(text) {
     if (!text || !text.trim()) {
       throw new Error('textToSpeech called with empty text - skipping ElevenLabs call');
@@ -406,7 +452,7 @@ class AuroraAgent {
     // Step 3: Check if we have all required data
     if (this.hasRequiredData()) {
       // Step 4: Add closing statement
-      response += "\n\nI've gathered all the information I need. Let me confirm what we'll do next: Our team will contact you within the timeframe I mentioned. Thank you for choosing Warm Home Inc!";
+      response += " I've got everything I need - our team will reach out within the timeframe I mentioned. Thank you for choosing Warm Home!";
 
       // Step 5: Save data and send SMS
       await this.saveInquiryData();
@@ -434,18 +480,17 @@ class AuroraAgent {
 exports.handleCall = async (req, res) => {
   console.log('🎤 TWILIO WEBHOOK HIT - Incoming call received!');
 
-  const agent = new AuroraAgent();
+  const callSid = req.body.CallSid;
+  const agent = getOrCreateAgent(callSid);
   const twiml = new twilio.twiml.VoiceResponse();
 
   try {
     // CRITICAL: Send TwiML response IMMEDIATELY to Twilio
     // Do NOT wait for ElevenLabs or any async operations!
 
-    const greeting = agent.getGreetingScript();
+    const greeting = sanitizeForSpeech(agent.getGreetingScript());
     console.log('📝 Greeting:', greeting);
 
-    // Use Twilio's built-in say() method instead of waiting for ElevenLabs
-    // This sends the TwiML response back to Twilio immediately
     const gather = twiml.gather({
       numDigits: 0,
       timeout: 30,
@@ -454,7 +499,6 @@ exports.handleCall = async (req, res) => {
       action: '/voice/gather-response'
     });
 
-    // Use Twilio's native say() instead of playing base64 audio
     gather.say(greeting, {
       voice: agent.config.voice.twilio.voice
     });
@@ -464,7 +508,7 @@ exports.handleCall = async (req, res) => {
     res.send(twiml.toString());
 
     // Generate ElevenLabs audio in background (doesn't block response, doesn't matter if it fails)
-    agent.textToSpeech(greeting).then((audioBuffer) => {
+    agent.textToSpeech(greeting).then(() => {
       console.log('✅ ElevenLabs audio generated successfully (background)');
     }).catch((error) => {
       console.error('❌ ElevenLabs error (background, non-fatal):', error.message);
@@ -481,26 +525,26 @@ exports.handleCall = async (req, res) => {
 exports.handleGatherResponse = async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const userMessage = req.body.SpeechResult || '';
-  const agent = new AuroraAgent();
+  const callSid = req.body.CallSid;
+  const agent = getOrCreateAgent(callSid);
 
   try {
-    // Process user message (Claude conversation + data extraction)
+    // Process user message (Claude conversation + data extraction) - this
+    // agent instance remembers everything said earlier in THIS call.
     const result = await agent.handleConversation(userMessage);
 
-    // FIX: Speak the reply using Twilio's own voice immediately and
-    // reliably - do NOT depend on ElevenLabs succeeding to respond to
-    // the caller. This is the same resilient pattern already used for
-    // the greeting in handleCall above.
-    const spokenText = (result && result.response && result.response.trim())
-      ? result.response
-      : "I'm sorry, could you say that one more time for me?";
+    const spokenText = sanitizeForSpeech(
+      (result && result.response && result.response.trim())
+        ? result.response
+        : "I'm sorry, could you say that one more time for me?"
+    );
 
     if (result.status === 'ready_to_route') {
       twiml.say(spokenText, { voice: agent.config.voice.twilio.voice });
       twiml.say("Thank you for calling. Goodbye!", { voice: agent.config.voice.twilio.voice });
       twiml.hangup();
+      endCallSession(callSid); // conversation is done - free the memory
     } else {
-      // Continue gathering
       const gather = twiml.gather({
         numDigits: 0,
         timeout: 30,
@@ -528,9 +572,17 @@ exports.handleGatherResponse = async (req, res) => {
     console.error('❌ Gather response error:', error);
     twiml.say("I apologize, I'm having difficulty. Please call back soon.", { voice: 'Polly.Joanna-Neural' });
     twiml.hangup();
+    endCallSession(callSid);
     res.type('text/xml');
     res.send(twiml.toString());
   }
+};
+
+// Clean up if Twilio tells us the call ended for any reason (hangup, no-answer, etc.)
+exports.handleCallStatus = async (req, res) => {
+  const callSid = req.body.CallSid;
+  if (callSid) endCallSession(callSid);
+  res.sendStatus(200);
 };
 
 // ============================================
@@ -546,7 +598,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '1.0.0',
+    version: '2.0.0',
     timestamp: new Date().toISOString()
   });
 });
@@ -554,6 +606,7 @@ app.get('/', (req, res) => {
 // Voice webhook endpoints
 app.post('/voice', exports.handleCall);
 app.post('/voice/gather-response', exports.handleGatherResponse);
+app.post('/voice/status', exports.handleCallStatus);
 
 // Start server
 const PORT = process.env.PORT || 3000;
