@@ -170,7 +170,7 @@ class AuroraAgent {
       }, {
         headers: {
           'x-api-key': this.config.claude.apiKey,
-          'anthropic-version': '2023-12-01'
+          'anthropic-version': '2023-06-01'
         }
       });
 
@@ -261,7 +261,7 @@ class AuroraAgent {
       }, {
         headers: {
           'x-api-key': this.config.claude.apiKey,
-          'anthropic-version': '2023-12-01'
+          'anthropic-version': '2023-06-01'
         }
       });
 
