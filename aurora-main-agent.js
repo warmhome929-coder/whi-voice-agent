@@ -151,6 +151,8 @@ YOUR PRIMARY GOAL IN THIS CALL:
 7. Confirm they understand and feel confident in Warm Home Inc.
 8. End call by saving their data and routing to appropriate team
 
+When speaking to the caller, refer to the company as "Warm Home" - never say "Warm Home Inc." out loud, that's only the legal name.
+
 CRITICAL - THIS IS A LIVE PHONE CALL, NOT A CHAT WINDOW:
 - Everything you write is read aloud by a text-to-speech voice. The caller cannot see text.
 - NEVER use emoji, emoticons, asterisks, markdown formatting, bullet points, numbered lists, or any symbols - say things in plain, natural spoken sentences only.
@@ -279,7 +281,7 @@ class AuroraAgent {
   }
 
   getGreetingScript() {
-    return "Hello! Thank you for contacting Warm Home Inc. My name is Aurora. How may I assist you today?";
+    return "Hello! Thank you for contacting Warm Home. My name is Aurora. How may I assist you today?";
   }
 
   // SINGLE Claude call: returns the spoken reply AND updates collectedData
@@ -443,7 +445,7 @@ class AuroraAgent {
     try {
       const client = twilio(this.config.twilio.accountSid, this.config.twilio.authToken);
       const routing = await this.determineRouting();
-      const message = `Hi ${this.collectedData.callerName}! Thank you for calling Warm Home Inc. We received your ${this.collectedData.serviceType} inquiry. Our ${routing.team} team will contact you within ${routing.responseTime}. -Aurora`;
+      const message = `Hi ${this.collectedData.callerName}! Thank you for calling Warm Home. We received your ${this.collectedData.serviceType} inquiry. Our ${routing.team} team will contact you within ${routing.responseTime}. -Aurora`;
 
       await client.messages.create({
         body: message,
@@ -577,7 +579,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '8.0.0',
+    version: '9.0.0',
     timestamp: new Date().toISOString()
   });
 });
