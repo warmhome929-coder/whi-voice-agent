@@ -29,6 +29,25 @@
  *    fallback if it's slow/fails, call memory across the whole call,
  *    no spoken-aloud emoji, short natural phone-style replies, brief
  *    pause before speaking to avoid clipping the first word.
+ *
+ * v10 FIX (ElevenLabs falling back to the Twilio voice on every call):
+ * two changes, both aimed at this:
+ *  1. The ElevenLabs timeout was only 2.5 seconds. That's tight for a
+ *     real network round trip to ElevenLabs, especially on the very
+ *     first request after Render's server has been idle. If it was
+ *     simply running out of time, this alone will fix it - there's no
+ *     harm raising it since Twilio still allows up to 30 seconds before
+ *     it gives up waiting for a response.
+ *  2. The old error log only printed error.message, which for a failed
+ *     web request is often just "Request failed with status code 401"
+ *     with no detail about WHY. Now it prints the HTTP status code and
+ *     ElevenLabs' own error body, so if it fails again the Render logs
+ *     will show the real reason (bad API key, no quota left, invalid
+ *     voice ID, etc.) instead of a dead end.
+ *  Also added a one-time startup log that lists which required API
+ *  keys are present/missing (without printing the actual secret
+ *  values), so a missing key in Render's Environment tab shows up
+ *  immediately in the logs instead of only failing later on a call.
  */
 
 const twilio = require('twilio');
@@ -57,7 +76,7 @@ const AURORA_CONFIG = {
       stability: 0.5,
       similarityBoost: 0.75,
       speed: 0.97,
-      timeoutMs: 2500 // give up and use Twilio's voice if ElevenLabs is slower than this
+      timeoutMs: 6000 // give up and use Twilio's voice if ElevenLabs is slower than this (v10: raised from 2500)
     },
     twilioFallback: {
       voice: 'Polly.Joanna-Neural'
@@ -255,7 +274,19 @@ async function speak(twimlNode, agent, text, req) {
     twimlNode.play(url);
     console.log('✅ Speaking via ElevenLabs:', url);
   } catch (error) {
-    console.error('⚠️ ElevenLabs unavailable, using Twilio voice instead:', error.message);
+    // v10: log the actual HTTP status + ElevenLabs' own error body (not just
+    // error.message) so the real cause shows up in Render logs - bad API
+    // key, no quota, invalid voice ID, timeout, etc. all look identical
+    // as a bare "error.message" but are very different problems.
+    const status = error.response?.status;
+    let body = error.response?.data;
+    if (body && Buffer.isBuffer(body)) {
+      try { body = JSON.parse(body.toString('utf8')); } catch (_) { body = body.toString('utf8'); }
+    }
+    console.error('⚠️ ElevenLabs unavailable, using Twilio voice instead.');
+    console.error('   message:', error.message);
+    if (status) console.error('   http status:', status);
+    if (body) console.error('   response body:', JSON.stringify(body));
     twimlNode.pause({ length: 1 });
     twimlNode.say(cleanText, { voice: agent.config.voice.twilioFallback.voice });
   }
@@ -579,7 +610,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '9.0.0',
+    version: '10.0.0',
     timestamp: new Date().toISOString()
   });
 });
@@ -598,11 +629,32 @@ app.post('/voice', exports.handleCall);
 app.post('/voice/gather-response', exports.handleGatherResponse);
 app.post('/voice/status', exports.handleCallStatus);
 
+// v10: log which required keys are actually present at startup - without
+// printing the secret values themselves - so a missing/blank env var in
+// Render's Environment tab shows up in the logs immediately instead of
+// only surfacing later as a mysterious failure mid-call.
+function logKeyStatus() {
+  const checks = [
+    ['TWILIO_ACCOUNT_SID', AURORA_CONFIG.twilio.accountSid],
+    ['TWILIO_AUTH_TOKEN', AURORA_CONFIG.twilio.authToken],
+    ['TWILIO_PHONE_FROM', AURORA_CONFIG.twilio.phoneFrom],
+    ['ELEVENLABS_API_KEY', AURORA_CONFIG.voice.elevenlabs.apiKey],
+    ['ANTHROPIC_API_KEY', AURORA_CONFIG.claude.apiKey],
+    ['SUPABASE_URL', AURORA_CONFIG.supabase.url],
+    ['SUPABASE_KEY', AURORA_CONFIG.supabase.key]
+  ];
+  console.log('🔑 Environment variable check:');
+  for (const [name, value] of checks) {
+    console.log(`   ${value ? '✅' : '❌ MISSING'} ${name}`);
+  }
+}
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🎤 Aurora Voice Agent running on port ${PORT}`);
   console.log(`📱 Ready to receive calls on all 8 phone numbers`);
   console.log(`🤖 Using Claude API (single call/turn) + ElevenLabs voice (with Twilio fallback)`);
+  logKeyStatus();
 });
 
 module.exports = { AuroraAgent, app };
