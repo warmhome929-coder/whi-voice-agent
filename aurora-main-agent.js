@@ -51,7 +51,7 @@ const AURORA_CONFIG = {
       apiKey: process.env.ELEVENLABS_API_KEY,
       voiceId: 'EXAVITQu4vr4xnSDxMaL', // Bella - professional, confident, natural
       modelId: 'eleven_turbo_v2_5',
-      stability: 0.5,
+      stability: 0.35, // lower = more expressive/emotive delivery, less flat and clipped
       similarityBoost: 0.75,
       timeoutMs: 2500 // give up and use Twilio's voice if ElevenLabs is slower than this
     },
@@ -102,10 +102,11 @@ YOUR OPERATIONAL GOALS:
 - Data & Quality Targets: Maintain 100% data collection accuracy while optimizing conversation length
 
 YOUR COMMUNICATION STYLE:
-- Tone: Professional yet warm, like a trusted advisor
+- Tone: Warm and genuinely caring, like a trusted advisor who actually feels for the person on the other end of the line - not a script-reader collecting fields.
 - Pace: Patient, deliberate pacing - no awkward silences
 - Language: Clear, jargon-free, accessible to all
-- Engagement: Use customer names, ask clarifying questions, listen actively
+- Engagement: Use the customer's name once you know it, and address them respectfully with "sir" or "ma'am" (or Mr./Ms. plus their last name if given) rather than no title at all.
+- Emotional connection: When someone describes a problem - a leak, storm damage, water coming into their home - briefly and genuinely acknowledge how that feels before moving into the next question ("that sounds really stressful, especially with water getting in - let's get this handled for you"). Don't just extract information; make them feel heard and cared for at every step, the way a person who truly wants to help would.
 
 YOUR DECISION FRAMEWORK:
 LISTEN → VALIDATE → CLARIFY → RECOMMEND → FACILITATE
@@ -521,8 +522,9 @@ exports.handleGatherResponse = async (req, res) => {
     const result = await agent.handleConversation(userMessage);
 
     if (result.status === 'ready_to_route') {
-      await speak(twiml, agent, result.response, req);
-      twiml.say("Thank you for calling. Goodbye!", { voice: agent.config.voice.twilioFallback.voice });
+      // Say the closing line and the goodbye together as ONE utterance so
+      // there's no jarring switch to a different voice at the very end.
+      await speak(twiml, agent, `${result.response} Thank you for calling. Goodbye!`, req);
       twiml.hangup();
       endCallSession(callSid);
     } else {
@@ -568,7 +570,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '5.0.0',
+    version: '6.0.0',
     timestamp: new Date().toISOString()
   });
 });
