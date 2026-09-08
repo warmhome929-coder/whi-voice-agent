@@ -5,22 +5,21 @@
  *
  * Technology: Node.js + Twilio + ElevenLabs + Claude API + Supabase
  *
- * FIXES IN THIS VERSION (v3):
- *  - SPEED: The two Claude calls per turn (data extraction + reply
- *    generation) now run in PARALLEL instead of one after another,
- *    roughly halving the "hesitation" delay.
- *  - REAL ELEVENLABS VOICE, SAFELY: ElevenLabs audio is now properly
- *    hosted at a real URL on this same server (Twilio's <Play> needs a
- *    real fetchable URL, not an inline data: URI - inline never
- *    actually worked). Aurora tries ElevenLabs first (with a timeout),
- *    and only falls back to Twilio's own voice if ElevenLabs is too
- *    slow or fails - so the nicer voice plays when possible, but a
- *    slow/broken ElevenLabs can never break the call again.
- *  - NO WORD CLIPPING: a brief pause is added before Aurora starts
- *    speaking each turn, so the first word ("Aurora", "Warm Home")
- *    doesn't get cut off at the start of the audio.
- *  - (carried over from v2) Call memory across the whole call (keyed by
- *    CallSid), no spoken-aloud emoji, short natural phone-style replies.
+ * FIXES IN THIS VERSION (v4):
+ *  - ONE CLAUDE CALL PER TURN (not two, and not two-in-parallel): v3's
+ *    "run both calls at once" attempt likely tripped a rate limit,
+ *    which is why every reply became "I'm having trouble processing
+ *    your request." Now a single Claude call returns BOTH the spoken
+ *    reply AND the extracted customer data together, as one JSON
+ *    response. This is faster than v1/v2 (half the API calls) and
+ *    removes the failure risk v3 introduced.
+ *  - Shorter ElevenLabs wait (2.5s instead of 3.5s) before falling
+ *    back to the Twilio voice, so a slow ElevenLabs response can't
+ *    stack extra delay on top of the Claude call.
+ *  - (carried over) Real ElevenLabs voice hosted at a real URL, Twilio
+ *    fallback if it's slow/fails, call memory across the whole call,
+ *    no spoken-aloud emoji, short natural phone-style replies, brief
+ *    pause before speaking to avoid clipping the first word.
  */
 
 const twilio = require('twilio');
@@ -32,14 +31,12 @@ const axios = require('axios');
 // ============================================
 
 const AURORA_CONFIG = {
-  // Twilio Configuration
   twilio: {
     accountSid: process.env.TWILIO_ACCOUNT_SID,
     authToken: process.env.TWILIO_AUTH_TOKEN,
     phoneFrom: process.env.TWILIO_PHONE_FROM || '+15043215552'
   },
 
-  // Voice Configuration
   voice: {
     elevenlabs: {
       apiKey: process.env.ELEVENLABS_API_KEY,
@@ -47,31 +44,24 @@ const AURORA_CONFIG = {
       modelId: 'eleven_turbo_v2_5',
       stability: 0.5,
       similarityBoost: 0.75,
-      // If ElevenLabs hasn't responded within this long, fall back to Twilio's voice
-      // rather than make the caller wait in silence.
-      timeoutMs: 3500
+      timeoutMs: 2500 // give up and use Twilio's voice if ElevenLabs is slower than this
     },
     twilioFallback: {
-      // Used only if ElevenLabs times out or errors.
-      // Polly neural voice pronounces names far more reliably than the generic 'woman' voice.
       voice: 'Polly.Joanna-Neural'
     }
   },
 
-  // Claude API Configuration
   claude: {
     apiKey: process.env.ANTHROPIC_API_KEY,
     model: 'claude-sonnet-5',
-    maxTokens: 300 // Keep phone replies short - long responses feel unnatural spoken aloud
+    maxTokens: 500
   },
 
-  // Supabase Configuration
   supabase: {
     url: process.env.SUPABASE_URL,
     key: process.env.SUPABASE_KEY
   },
 
-  // Aurora Persona
   aurora: {
     name: 'Aurora',
     alternateNames: ['Grace', 'Angel', 'Hope'],
@@ -81,8 +71,7 @@ const AURORA_CONFIG = {
 };
 
 // ============================================
-// AURORA SYSTEM PROMPT - YOUR EXACT SPECIFICATION
-// (+ voice-call ground rules added at the end)
+// AURORA SYSTEM PROMPT
 // ============================================
 
 const AURORA_SYSTEM_PROMPT = `You are Aurora, a professional, warm, and articulate digital assistant for Warm Home Inc. Your role is to be adaptable, helpful, and ready to assist with a wide variety of inquiries, information gathering, or administrative tasks for the company as a whole, always maintaining a warm and empathetic tone.
@@ -152,11 +141,25 @@ CRITICAL - THIS IS A LIVE PHONE CALL, NOT A CHAT WINDOW:
 - Everything you write is read aloud by a text-to-speech voice. The caller cannot see text.
 - NEVER use emoji, emoticons, asterisks, markdown formatting, bullet points, numbered lists, or any symbols - say things in plain, natural spoken sentences only.
 - Keep every reply SHORT: 1-3 sentences per turn. Ask one question at a time. Real phone agents don't give long speeches - they have a brief, natural back-and-forth.
-- Be warm but efficient - skip long compliments or gushing reactions to small talk. A brief, genuine acknowledgment is enough, then move the conversation forward.`;
+- Be warm but efficient - skip long compliments or gushing reactions to small talk. A brief, genuine acknowledgment is enough, then move the conversation forward.
+
+CRITICAL - OUTPUT FORMAT:
+You must respond with ONLY a single valid JSON object, nothing else - no text before or after it, no markdown code fences. The shape is exactly:
+{
+  "reply": "<what you say out loud next, following all the voice-call rules above>",
+  "extracted": {
+    "name": "<customer's name if mentioned this call so far, else null>",
+    "phone": "<phone number as XXX-XXX-XXXX if mentioned, else null>",
+    "email": "<email if mentioned, else null>",
+    "serviceType": "<one of: roofing, tarping, tree, exterior, interior, waterproofing, armor, newbuild, millwork - only if clearly identified, else null>",
+    "urgencyLevel": "<EMERGENCY, URGENT, or ROUTINE if you can judge it from what's been said, else null>",
+    "description": "<brief description of their issue if known, else null>",
+    "address": "<property address if mentioned, else null>"
+  }
+}`;
 
 // ============================================
-// SPEECH SANITIZATION - strip anything that
-// would sound wrong or get read aloud literally
+// SPEECH SANITIZATION
 // ============================================
 
 function sanitizeForSpeech(text) {
@@ -170,13 +173,10 @@ function sanitizeForSpeech(text) {
 
 // ============================================
 // TEMPORARY AUDIO HOSTING
-// Twilio's <Play> needs a real, fetchable HTTPS URL - it can't play an
-// inline base64 data: URI. So we hold each generated clip in memory
-// under a short-lived id and serve it back at /audio/:id.mp3.
 // ============================================
 
-const audioCache = new Map(); // id -> { buffer, expiresAt }
-const AUDIO_TTL_MS = 2 * 60 * 1000; // 2 minutes is plenty - Twilio fetches it within seconds
+const audioCache = new Map();
+const AUDIO_TTL_MS = 2 * 60 * 1000;
 
 function storeAudioClip(buffer) {
   pruneExpiredAudio();
@@ -198,8 +198,6 @@ function buildAudioUrl(req, id) {
 
 // ============================================
 // PER-CALL SESSION MEMORY
-// Keyed by Twilio's CallSid so Aurora remembers the conversation from
-// pickup to hangup, instead of starting fresh on every single sentence.
 // ============================================
 
 const activeCalls = new Map();
@@ -216,9 +214,8 @@ function endCallSession(callSid) {
 }
 
 // ============================================
-// HELPER: speak text using ElevenLabs if it responds in time,
-// otherwise fall back to Twilio's own voice. Never blocks longer
-// than the configured timeout, never throws.
+// HELPER: speak text via ElevenLabs if it responds in time,
+// otherwise Twilio's own voice. Never blocks past the timeout.
 // ============================================
 
 async function speak(twimlNode, agent, text, req) {
@@ -265,13 +262,14 @@ class AuroraAgent {
     };
   }
 
-  // GREETING SCRIPT
   getGreetingScript() {
     return "Hello! Thank you for contacting Warm Home Inc. My name is Aurora. How may I assist you today?";
   }
 
-  // GENERATE AURORA RESPONSE USING CLAUDE
-  async generateResponse(userMessage) {
+  // SINGLE Claude call: returns the spoken reply AND updates collectedData
+  // from the extracted fields in the same response. Replaces the old
+  // two-call (generateResponse + extractDataFromMessage) approach.
+  async converseAndExtract(userMessage) {
     try {
       const messages = [
         ...this.conversationHistory,
@@ -290,19 +288,45 @@ class AuroraAgent {
         }
       });
 
-      let assistantMessage = sanitizeForSpeech(response.data.content[0].text);
+      let raw = response.data.content[0].text.trim();
+      raw = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
 
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (parseError) {
+        // Claude didn't return clean JSON this turn - fall back to using
+        // whatever text it did produce as the spoken reply, and skip
+        // extraction just for this turn rather than failing the call.
+        console.error('JSON parse failed, using raw text as reply:', parseError.message);
+        const fallbackReply = sanitizeForSpeech(raw);
+        this.conversationHistory.push({ role: 'user', content: userMessage });
+        this.conversationHistory.push({ role: 'assistant', content: fallbackReply });
+        return fallbackReply || "I'm sorry, could you say that one more time for me?";
+      }
+
+      const reply = sanitizeForSpeech(parsed.reply || '');
+      const ex = parsed.extracted || {};
+      if (ex.name) this.collectedData.callerName = ex.name;
+      if (ex.phone) this.collectedData.callerPhone = ex.phone;
+      if (ex.email) this.collectedData.callerEmail = ex.email;
+      if (ex.serviceType) this.collectedData.serviceType = ex.serviceType;
+      if (ex.urgencyLevel) this.collectedData.urgencyLevel = ex.urgencyLevel;
+      if (ex.description) this.collectedData.issueDescription = ex.description;
+      if (ex.address) this.collectedData.propertyAddress = ex.address;
+
+      // Store just the natural reply in history (not the JSON wrapper) so
+      // future turns read like a normal conversation.
       this.conversationHistory.push({ role: 'user', content: userMessage });
-      this.conversationHistory.push({ role: 'assistant', content: assistantMessage });
+      this.conversationHistory.push({ role: 'assistant', content: reply });
 
-      return assistantMessage;
+      return reply;
     } catch (error) {
       console.error('Claude API Error:', error.response?.data || error.message);
       return "I apologize, I'm having trouble processing your request. Could you please try again?";
     }
   }
 
-  // CONVERT TEXT TO SPEECH USING ELEVENLABS
   async textToSpeech(text) {
     if (!text || !text.trim()) {
       throw new Error('textToSpeech called with empty text - skipping ElevenLabs call');
@@ -325,10 +349,9 @@ class AuroraAgent {
         responseType: 'arraybuffer'
       }
     );
-    return response.data; // audio buffer
+    return response.data;
   }
 
-  // DATA COLLECTION - CHECK IF ALL REQUIRED FIELDS COLLECTED
   hasRequiredData() {
     return (
       this.collectedData.callerName &&
@@ -340,55 +363,6 @@ class AuroraAgent {
     );
   }
 
-  // EXTRACT DATA FROM USER MESSAGE
-  async extractDataFromMessage(userMessage) {
-    const extractionPrompt = `Extract the following information from this customer message. Return as JSON with null for missing fields:
-    {
-      "name": "customer's name",
-      "phone": "phone number format: XXX-XXX-XXXX",
-      "email": "email address",
-      "serviceType": "which service: roofing/tarping/tree/exterior/interior/waterproofing/armor/newbuild/millwork",
-      "urgencyLevel": "EMERGENCY/URGENT/ROUTINE based on description",
-      "description": "brief description of the issue",
-      "address": "property address"
-    }
-
-    Customer message: "${userMessage}"
-
-    Return ONLY valid JSON, no other text.`;
-
-    try {
-      const response = await axios.post('https://api.anthropic.com/v1/messages', {
-        model: this.config.claude.model,
-        max_tokens: 500,
-        messages: [{ role: 'user', content: extractionPrompt }]
-      }, {
-        headers: {
-          'x-api-key': this.config.claude.apiKey,
-          'anthropic-version': '2023-06-01'
-        }
-      });
-
-      let jsonText = response.data.content[0].text;
-      jsonText = jsonText.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
-      const extracted = JSON.parse(jsonText);
-
-      if (extracted.name) this.collectedData.callerName = extracted.name;
-      if (extracted.phone) this.collectedData.callerPhone = extracted.phone;
-      if (extracted.email) this.collectedData.callerEmail = extracted.email;
-      if (extracted.serviceType) this.collectedData.serviceType = extracted.serviceType;
-      if (extracted.urgencyLevel) this.collectedData.urgencyLevel = extracted.urgencyLevel;
-      if (extracted.description) this.collectedData.issueDescription = extracted.description;
-      if (extracted.address) this.collectedData.propertyAddress = extracted.address;
-
-      return extracted;
-    } catch (error) {
-      console.error('Data extraction error:', error.response?.data || error.message);
-      return {};
-    }
-  }
-
-  // DETERMINE ROUTING DECISION
   async determineRouting() {
     const urgency = this.collectedData.urgencyLevel;
     const service = this.collectedData.serviceType;
@@ -402,7 +376,6 @@ class AuroraAgent {
     }
   }
 
-  // SAVE INQUIRY DATA TO SUPABASE
   async saveInquiryData() {
     try {
       const payload = {
@@ -438,7 +411,6 @@ class AuroraAgent {
     }
   }
 
-  // SEND SMS CONFIRMATION
   async sendSMSConfirmation() {
     try {
       const client = twilio(this.config.twilio.accountSid, this.config.twilio.authToken);
@@ -456,33 +428,26 @@ class AuroraAgent {
     }
   }
 
-  // MAIN CONVERSATION FLOW
   async handleConversation(userMessage) {
-    // Run data extraction and reply generation IN PARALLEL instead of
-    // one after another - this is the main latency fix.
-    const [, response] = await Promise.all([
-      this.extractDataFromMessage(userMessage),
-      this.generateResponse(userMessage)
-    ]);
+    let response = await this.converseAndExtract(userMessage);
 
-    let finalResponse = response;
-    if (!finalResponse || !finalResponse.trim()) {
-      finalResponse = "I'm sorry, could you say that one more time for me?";
+    if (!response || !response.trim()) {
+      response = "I'm sorry, could you say that one more time for me?";
     }
 
     if (this.hasRequiredData()) {
-      finalResponse += " I've got everything I need - our team will reach out within the timeframe I mentioned. Thank you for choosing Warm Home!";
+      response += " I've got everything I need - our team will reach out within the timeframe I mentioned. Thank you for choosing Warm Home!";
       await this.saveInquiryData();
       await this.sendSMSConfirmation();
       return {
-        response: finalResponse,
+        response,
         status: 'ready_to_route',
         routing: await this.determineRouting()
       };
     }
 
     return {
-      response: finalResponse,
+      response,
       status: 'collecting_data',
       dataCollected: this.collectedData
     };
@@ -565,7 +530,6 @@ exports.handleGatherResponse = async (req, res) => {
   }
 };
 
-// Clean up if Twilio tells us the call ended for any reason (hangup, no-answer, etc.)
 exports.handleCallStatus = async (req, res) => {
   const callSid = req.body.CallSid;
   if (callSid) endCallSession(callSid);
@@ -581,16 +545,14 @@ const app = express();
 
 app.use(express.urlencoded({ extended: false }));
 
-// Health check
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '3.0.0',
+    version: '4.0.0',
     timestamp: new Date().toISOString()
   });
 });
 
-// Serve temporarily-hosted ElevenLabs audio clips for Twilio's <Play> to fetch
 app.get('/audio/:id.mp3', (req, res) => {
   const clip = audioCache.get(req.params.id);
   if (!clip) {
@@ -601,17 +563,15 @@ app.get('/audio/:id.mp3', (req, res) => {
   res.send(clip.buffer);
 });
 
-// Voice webhook endpoints
 app.post('/voice', exports.handleCall);
 app.post('/voice/gather-response', exports.handleGatherResponse);
 app.post('/voice/status', exports.handleCallStatus);
 
-// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🎤 Aurora Voice Agent running on port ${PORT}`);
   console.log(`📱 Ready to receive calls on all 8 phone numbers`);
-  console.log(`🤖 Using Claude API + ElevenLabs voice (with Twilio fallback)`);
+  console.log(`🤖 Using Claude API (single call/turn) + ElevenLabs voice (with Twilio fallback)`);
 });
 
 module.exports = { AuroraAgent, app };
