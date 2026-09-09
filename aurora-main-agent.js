@@ -93,7 +93,7 @@ const AURORA_CONFIG = {
   voice: {
     elevenlabs: {
       apiKey: process.env.ELEVENLABS_API_KEY,
-      voiceId: 'EXAVITQu4vr4xnSDxMaL', // Bella - professional, confident, natural
+      voiceId: 'OYTbf65OHHFELVut7v2H', // v20: Joseph's chosen voice from ElevenLabs' Voice Library
       modelId: 'eleven_turbo_v2_5',
       // v6 tried stability 0.35 + speed 0.92 together to fix "too fast/flat" -
       // that combo made her sound slurred and sleepy instead. Reverting
@@ -752,7 +752,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '19.0.0',
+    version: '20.0.0',
     timestamp: new Date().toISOString()
   });
 });
