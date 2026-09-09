@@ -62,7 +62,7 @@
  * webhook setting) - voice-only numbers can't send texts.
  *
  * v13 CHANGES (name + speech quality, no voice model change):
- *  - Agent's spoken/texted name changed from Aurora to Jennifer.
+ *  - Agent's spoken/texted name changed from Aurora to Amy.
  *  - Added abbreviation expansion (ASAP, approx., e.g., hrs, sq ft,
  *    etc.) so the voice reads them as real words instead of
  *    stumbling over the letters. Starting set - easy to extend.
@@ -125,7 +125,7 @@ const AURORA_CONFIG = {
   },
 
   aurora: {
-    name: 'Jennifer',
+    name: 'Amy',
     alternateNames: ['Grace', 'Angel', 'Hope'],
     tone: 'Professional, warm, articulate, and empathetic',
     delivery: 'Patient vocal delivery with deliberate pacing to build trust'
@@ -136,7 +136,7 @@ const AURORA_CONFIG = {
 // AURORA SYSTEM PROMPT
 // ============================================
 
-const AURORA_SYSTEM_PROMPT = `You are Jennifer, a professional, warm, and articulate digital assistant for Warm Home Inc. Your role is to be adaptable, helpful, and ready to assist with a wide variety of inquiries, information gathering, or administrative tasks for the company as a whole, always maintaining a warm and empathetic tone.
+const AURORA_SYSTEM_PROMPT = `You are Amy, a professional, warm, and articulate digital assistant for Warm Home Inc. Your role is to be adaptable, helpful, and ready to assist with a wide variety of inquiries, information gathering, or administrative tasks for the company as a whole, always maintaining a warm and empathetic tone.
 
 YOUR SEVEN CORE ROLES:
 1. General Inquiry & Intake Specialist: Systematically gather complete and accurate details, assess urgency and intent to route or address issues effectively
@@ -385,7 +385,7 @@ class AuroraAgent {
   }
 
   getGreetingScript() {
-    return "Hello! Thank you for contacting Warm Home. My name is Jennifer. How may I assist you today?";
+    return "Hello! Thank you for contacting Warm Home. My name is Amy. How may I assist you today?";
   }
 
   // SINGLE Claude call: returns the spoken reply AND updates collectedData
@@ -523,7 +523,7 @@ class AuroraAgent {
         timestamp: new Date().toISOString(),
         routing_team: (await this.determineRouting()).team,
         call_status: 'completed',
-        agent_name: 'Jennifer'
+        agent_name: 'Amy'
       };
 
       const response = await axios.post(
@@ -549,7 +549,7 @@ class AuroraAgent {
     try {
       const client = twilio(this.config.twilio.accountSid, this.config.twilio.authToken);
       const routing = await this.determineRouting();
-      const message = `Hi ${this.collectedData.callerName}! Thank you for calling Warm Home. We received your ${this.collectedData.serviceType} inquiry. Our ${routing.team} team will contact you within ${routing.responseTime}. -Jennifer`;
+      const message = `Hi ${this.collectedData.callerName}! Thank you for calling Warm Home. We received your ${this.collectedData.serviceType} inquiry. Our ${routing.team} team will contact you within ${routing.responseTime}. -Amy`;
 
       // v11: text back from the same number the customer called, so it
       // looks like a reply from the number they dialed, not a stranger
@@ -689,7 +689,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '13.0.0',
+    version: '14.0.0',
     timestamp: new Date().toISOString()
   });
 });
