@@ -48,6 +48,18 @@
  *  keys are present/missing (without printing the actual secret
  *  values), so a missing key in Render's Environment tab shows up
  *  immediately in the logs instead of only failing later on a call.
+ *
+ * v11 FIX (confirmation texts should come from whichever number the
+ * customer actually called, not always the same one number): Twilio
+ * tells us, on every webhook hit, which of our numbers the customer
+ * dialed (the "To" field). That's now captured when the call starts
+ * and used as the "from" number when sending the SMS confirmation, so
+ * a customer who called the NY number gets their text from the NY
+ * number, not from whatever single number TWILIO_PHONE_FROM holds.
+ * Falls back to TWILIO_PHONE_FROM only if that's somehow missing.
+ * NOTE: each number sending texts this way must have SMS capability
+ * turned on for it in Twilio's console (separate from the voice
+ * webhook setting) - voice-only numbers can't send texts.
  */
 
 const twilio = require('twilio');
@@ -237,9 +249,14 @@ function buildAudioUrl(req, id) {
 
 const activeCalls = new Map();
 
-function getOrCreateAgent(callSid) {
+function getOrCreateAgent(callSid, calledNumber) {
   if (!activeCalls.has(callSid)) {
-    activeCalls.set(callSid, new AuroraAgent());
+    const agent = new AuroraAgent();
+    if (calledNumber) agent.calledNumber = calledNumber;
+    activeCalls.set(callSid, agent);
+  } else if (calledNumber) {
+    const agent = activeCalls.get(callSid);
+    if (!agent.calledNumber) agent.calledNumber = calledNumber;
   }
   return activeCalls.get(callSid);
 }
@@ -300,6 +317,10 @@ class AuroraAgent {
   constructor() {
     this.config = AURORA_CONFIG;
     this.conversationHistory = [];
+    // v11: which of our Twilio numbers the customer actually called, so
+    // confirmation texts can be sent from that same number. Set from the
+    // webhook's "To" field as soon as the call comes in.
+    this.calledNumber = null;
     this.collectedData = {
       callerName: null,
       callerPhone: null,
@@ -478,12 +499,18 @@ class AuroraAgent {
       const routing = await this.determineRouting();
       const message = `Hi ${this.collectedData.callerName}! Thank you for calling Warm Home. We received your ${this.collectedData.serviceType} inquiry. Our ${routing.team} team will contact you within ${routing.responseTime}. -Aurora`;
 
+      // v11: text back from the same number the customer called, so it
+      // looks like a reply from the number they dialed, not a stranger
+      // number. Falls back to the single configured number only if we
+      // somehow don't know which number was called.
+      const fromNumber = this.calledNumber || this.config.twilio.phoneFrom;
+
       await client.messages.create({
         body: message,
-        from: this.config.twilio.phoneFrom,
+        from: fromNumber,
         to: this.collectedData.callerPhone
       });
-      console.log('SMS sent successfully');
+      console.log(`SMS sent successfully from ${fromNumber}`);
     } catch (error) {
       console.error('SMS send error:', error.response?.data || error.message);
     }
@@ -523,7 +550,7 @@ exports.handleCall = async (req, res) => {
   console.log('🎤 TWILIO WEBHOOK HIT - Incoming call received!');
 
   const callSid = req.body.CallSid;
-  const agent = getOrCreateAgent(callSid);
+  const agent = getOrCreateAgent(callSid, req.body.To);
   const twiml = new twilio.twiml.VoiceResponse();
 
   try {
@@ -556,7 +583,7 @@ exports.handleGatherResponse = async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const userMessage = req.body.SpeechResult || '';
   const callSid = req.body.CallSid;
-  const agent = getOrCreateAgent(callSid);
+  const agent = getOrCreateAgent(callSid, req.body.To);
 
   try {
     const result = await agent.handleConversation(userMessage);
@@ -610,7 +637,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '10.0.0',
+    version: '11.0.0',
     timestamp: new Date().toISOString()
   });
 });
