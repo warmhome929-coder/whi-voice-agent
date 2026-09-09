@@ -418,7 +418,7 @@ class AuroraAgent {
   }
 
   getGreetingScript() {
-    return "Hello! Thank you for contacting Warm Home. My name is Amy. Who do I have the pleasure of speaking with today?";
+    return "Thank you for calling Warm Home. This is Amy speaking. Who do I have the pleasure of speaking to?";
   }
 
   // SINGLE Claude call: returns the spoken reply AND updates collectedData
@@ -752,7 +752,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '17.0.0',
+    version: '18.0.0',
     timestamp: new Date().toISOString()
   });
 });
