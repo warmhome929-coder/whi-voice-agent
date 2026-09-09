@@ -184,7 +184,7 @@ ALWAYS:
 - Respect customer autonomy
 - Make customer feel heard, respected, informed, confident, supported
 
-WARM HOME INC. SERVICES (9 Total):
+WARM HOME INC. SERVICES (10 Total):
 1. Roofing - Permanent repairs & replacements
 2. Tarping - Emergency temporary protection
 3. Tree Removal - Tree removal & stump grinding
@@ -194,6 +194,7 @@ WARM HOME INC. SERVICES (9 Total):
 7. Armor Plating - Polyurea protective coatings
 8. New Build - Construction, additions, renovations
 9. Millwork - Custom cabinets from NJ factory
+10. Solar - Solar panel installation and related services
 
 YOUR PRIMARY GOAL IN THIS CALL:
 1. Greet warmly and professionally, and get the caller's name right away, before asking about their issue
@@ -223,7 +224,7 @@ You must respond with ONLY a single valid JSON object, nothing else - no text be
     "name": "<customer's name if mentioned this call so far, else null>",
     "phone": "<phone number as XXX-XXX-XXXX if mentioned, else null>",
     "email": "<email if mentioned, else null>",
-    "serviceType": "<one of: roofing, tarping, tree, exterior, interior, waterproofing, armor, newbuild, millwork - only if clearly identified, else null>",
+    "serviceType": "<one of: roofing, tarping, tree, exterior, interior, waterproofing, armor, newbuild, millwork, solar - only if clearly identified, else null>",
     "urgencyLevel": "<EMERGENCY, URGENT, or ROUTINE if you can judge it from what's been said, else null>",
     "description": "<brief description of their issue if known, else null>",
     "addressStreet": "<street number and street name only, e.g. '7007 Veterans Boulevard', if mentioned this call so far (this turn or an earlier turn), else null>",
@@ -752,7 +753,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '20.0.0',
+    version: '21.0.0',
     timestamp: new Date().toISOString()
   });
 });
