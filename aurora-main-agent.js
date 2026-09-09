@@ -60,6 +60,19 @@
  * NOTE: each number sending texts this way must have SMS capability
  * turned on for it in Twilio's console (separate from the voice
  * webhook setting) - voice-only numbers can't send texts.
+ *
+ * v13 CHANGES (name + speech quality, no voice model change):
+ *  - Agent's spoken/texted name changed from Aurora to Jennifer.
+ *  - Added abbreviation expansion (ASAP, approx., e.g., hrs, sq ft,
+ *    etc.) so the voice reads them as real words instead of
+ *    stumbling over the letters. Starting set - easy to extend.
+ *  - Added a system-prompt instruction for asking questions with
+ *    genuine curiosity in the wording itself (word choice/phrasing),
+ *    since real vocal inflection tags like [curious] and [clears
+ *    throat] need a different ElevenLabs model (v3 Conversational)
+ *    that we have NOT switched to yet - current model would just
+ *    read a tag like "[clears throat]" out loud as literal words.
+ *    That model switch is a separate, bigger change to do later.
  */
 
 const twilio = require('twilio');
@@ -112,7 +125,7 @@ const AURORA_CONFIG = {
   },
 
   aurora: {
-    name: 'Aurora',
+    name: 'Jennifer',
     alternateNames: ['Grace', 'Angel', 'Hope'],
     tone: 'Professional, warm, articulate, and empathetic',
     delivery: 'Patient vocal delivery with deliberate pacing to build trust'
@@ -123,7 +136,7 @@ const AURORA_CONFIG = {
 // AURORA SYSTEM PROMPT
 // ============================================
 
-const AURORA_SYSTEM_PROMPT = `You are Aurora, a professional, warm, and articulate digital assistant for Warm Home Inc. Your role is to be adaptable, helpful, and ready to assist with a wide variety of inquiries, information gathering, or administrative tasks for the company as a whole, always maintaining a warm and empathetic tone.
+const AURORA_SYSTEM_PROMPT = `You are Jennifer, a professional, warm, and articulate digital assistant for Warm Home Inc. Your role is to be adaptable, helpful, and ready to assist with a wide variety of inquiries, information gathering, or administrative tasks for the company as a whole, always maintaining a warm and empathetic tone.
 
 YOUR SEVEN CORE ROLES:
 1. General Inquiry & Intake Specialist: Systematically gather complete and accurate details, assess urgency and intent to route or address issues effectively
@@ -147,6 +160,7 @@ YOUR COMMUNICATION STYLE:
 - Language: Clear, jargon-free, accessible to all
 - Engagement: Use the customer's name once you know it, and address them respectfully with "sir" or "ma'am" (or Mr./Ms. plus their last name if given) rather than no title at all.
 - Emotional connection: When someone describes a problem - a leak, storm damage, water coming into their home - briefly and genuinely acknowledge how that feels before moving into the next question ("that sounds really stressful, especially with water getting in - let's get this handled for you"). Don't just extract information; make them feel heard and cared for at every step, the way a person who truly wants to help would.
+- Curiosity: When you ask a question, phrase it like you're genuinely curious about their specific situation, not reading off a checklist. Prefer "What happened with the roof - was it the storm last night?" over a flat "What is the issue?" Vary your phrasing turn to turn rather than repeating the same question structure.
 
 YOUR DECISION FRAMEWORK:
 LISTEN → VALIDATE → CLARIFY → RECOMMEND → FACILITATE
@@ -214,9 +228,42 @@ You must respond with ONLY a single valid JSON object, nothing else - no text be
 // SPEECH SANITIZATION
 // ============================================
 
+// v13: common abbreviations the voice would otherwise stumble over or
+// spell out letter-by-letter. Deliberately leaves out "St." and "Dr."
+// since those are genuinely ambiguous (Street vs Saint, Drive vs
+// Doctor) and guessing wrong would be worse than leaving them alone.
+// Starting set - easy to add more as we notice mispronunciations.
+const ABBREVIATION_EXPANSIONS = [
+  [/\bASAP\b/gi, 'as soon as possible'],
+  [/\bapprox\.?(?![a-zA-Z])/gi, 'approximately'],
+  [/\be\.g\.(?![a-zA-Z])/gi, 'for example'],
+  [/\bi\.e\.(?![a-zA-Z])/gi, 'that is'],
+  [/\betc\.(?![a-zA-Z])/gi, 'et cetera'],
+  [/\bvs\.?(?![a-zA-Z])/gi, 'versus'],
+  [/\bw\/o(?![a-zA-Z])/gi, 'without'],
+  [/\bw\/(?![a-zA-Z])/gi, 'with'],
+  [/\bsq\.?\s?ft\.?(?![a-zA-Z])/gi, 'square feet'],
+  [/\bhrs?\.?(?![a-zA-Z])/gi, 'hours'],
+  [/\bmins?\.?(?![a-zA-Z])/gi, 'minutes'],
+  [/\bapt\.?(?![a-zA-Z])/gi, 'apartment'],
+  [/\bste\.?(?![a-zA-Z])/gi, 'suite'],
+  [/\bblvd\.?(?![a-zA-Z])/gi, 'boulevard'],
+  [/\bave\.?(?![a-zA-Z])/gi, 'avenue'],
+  [/\brd\.?(?![a-zA-Z])/gi, 'road']
+];
+
+function expandAbbreviations(text) {
+  if (!text) return text;
+  let result = text;
+  for (const [pattern, replacement] of ABBREVIATION_EXPANSIONS) {
+    result = result.replace(pattern, replacement);
+  }
+  return result;
+}
+
 function sanitizeForSpeech(text) {
   if (!text) return text;
-  return text
+  return expandAbbreviations(text)
     .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{FE0F}]/gu, '')
     .replace(/[*_#`~]/g, '')
     .replace(/\s{2,}/g, ' ')
@@ -338,7 +385,7 @@ class AuroraAgent {
   }
 
   getGreetingScript() {
-    return "Hello! Thank you for contacting Warm Home. My name is Aurora. How may I assist you today?";
+    return "Hello! Thank you for contacting Warm Home. My name is Jennifer. How may I assist you today?";
   }
 
   // SINGLE Claude call: returns the spoken reply AND updates collectedData
@@ -476,7 +523,7 @@ class AuroraAgent {
         timestamp: new Date().toISOString(),
         routing_team: (await this.determineRouting()).team,
         call_status: 'completed',
-        agent_name: 'Aurora'
+        agent_name: 'Jennifer'
       };
 
       const response = await axios.post(
@@ -502,7 +549,7 @@ class AuroraAgent {
     try {
       const client = twilio(this.config.twilio.accountSid, this.config.twilio.authToken);
       const routing = await this.determineRouting();
-      const message = `Hi ${this.collectedData.callerName}! Thank you for calling Warm Home. We received your ${this.collectedData.serviceType} inquiry. Our ${routing.team} team will contact you within ${routing.responseTime}. -Aurora`;
+      const message = `Hi ${this.collectedData.callerName}! Thank you for calling Warm Home. We received your ${this.collectedData.serviceType} inquiry. Our ${routing.team} team will contact you within ${routing.responseTime}. -Jennifer`;
 
       // v11: text back from the same number the customer called, so it
       // looks like a reply from the number they dialed, not a stranger
@@ -642,7 +689,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '12.0.0',
+    version: '13.0.0',
     timestamp: new Date().toISOString()
   });
 });
