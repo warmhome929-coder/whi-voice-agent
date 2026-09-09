@@ -88,7 +88,12 @@ const AURORA_CONFIG = {
       stability: 0.5,
       similarityBoost: 0.75,
       speed: 0.97,
-      timeoutMs: 6000 // give up and use Twilio's voice if ElevenLabs is slower than this (v10: raised from 2500)
+      // v12: v10's 6000ms wasn't the fix - ElevenLabs is still failing,
+      // it's just hanging until the timeout instead of failing fast. So
+      // there's no upside to waiting 6 full seconds every turn - cut it
+      // back down to keep calls responsive while we find the real cause
+      // from the error logging added in v10.
+      timeoutMs: 3000
     },
     twilioFallback: {
       voice: 'Polly.Joanna-Neural'
@@ -637,7 +642,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '11.0.0',
+    version: '12.0.0',
     timestamp: new Date().toISOString()
   });
 });
