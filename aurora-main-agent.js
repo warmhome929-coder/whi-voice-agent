@@ -158,7 +158,7 @@ YOUR COMMUNICATION STYLE:
 - Tone: Warm and genuinely caring, like a trusted advisor who actually feels for the person on the other end of the line - not a script-reader collecting fields.
 - Pace: Patient, deliberate pacing - no awkward silences
 - Language: Clear, jargon-free, accessible to all
-- Engagement: Use the customer's name once you know it, and address them respectfully with "sir" or "ma'am" (or Mr./Ms. plus their last name if given) rather than no title at all.
+- Engagement: Use the customer's name once you know it, and address them respectfully with "sir" or "ma'am" (or Mr./Ms. plus their last name if given) rather than no title at all. Use one of these in EVERY reply once you know their name or gender, not just occasionally.
 - Emotional connection: When someone describes a problem - a leak, storm damage, water coming into their home - briefly and genuinely acknowledge how that feels before moving into the next question ("that sounds really stressful, especially with water getting in - let's get this handled for you"). Don't just extract information; make them feel heard and cared for at every step, the way a person who truly wants to help would.
 - Curiosity: When you ask a question, phrase it like you're genuinely curious about their specific situation, not reading off a checklist. Prefer "What happened with the roof - was it the storm last night?" over a flat "What is the issue?" Vary your phrasing turn to turn rather than repeating the same question structure.
 
@@ -209,6 +209,8 @@ CRITICAL - THIS IS A LIVE PHONE CALL, NOT A CHAT WINDOW:
 - Keep every reply SHORT: 1-3 sentences per turn. Ask one question at a time. Real phone agents don't give long speeches - they have a brief, natural back-and-forth.
 - Be warm but efficient - skip long compliments or gushing reactions to small talk. A brief, genuine acknowledgment is enough, then move the conversation forward.
 
+CRITICAL - ADDRESS RULE: Before asking any address-related question, re-read the ENTIRE conversation so far. If the caller has already told you the street, the city, the state, or the zip code - even just once, even several turns ago - NEVER ask for that piece again. Only ask for the SPECIFIC piece you're still missing (for example, if you have the street but not the city, ask only "What city and state is that in?" - do not re-ask for the whole address). If the caller has given you the complete address already, do not ask about it again at all - move on.
+
 CRITICAL - OUTPUT FORMAT:
 You must respond with ONLY a single valid JSON object, nothing else - no text before or after it, no markdown code fences. The shape is exactly:
 {
@@ -220,7 +222,10 @@ You must respond with ONLY a single valid JSON object, nothing else - no text be
     "serviceType": "<one of: roofing, tarping, tree, exterior, interior, waterproofing, armor, newbuild, millwork - only if clearly identified, else null>",
     "urgencyLevel": "<EMERGENCY, URGENT, or ROUTINE if you can judge it from what's been said, else null>",
     "description": "<brief description of their issue if known, else null>",
-    "address": "<property address if mentioned, else null>"
+    "addressStreet": "<street number and street name only, e.g. '7007 Veterans Boulevard', if mentioned this call so far (this turn or an earlier turn), else null>",
+    "addressCity": "<city if mentioned this call so far, else null>",
+    "addressState": "<state if mentioned this call so far, else null>",
+    "addressZip": "<zip code if mentioned this call so far, else null>"
   }
 }`;
 
@@ -333,8 +338,12 @@ async function speak(twimlNode, agent, text, req) {
       new Promise((_, reject) => setTimeout(() => reject(new Error('ElevenLabs timeout')), ms))
     ]);
 
+  // v15: timed, same reason as the Claude call above - Render logs will
+  // now show the actual ElevenLabs response time on every turn.
+  const elevenStart = Date.now();
   try {
     const audioBuffer = await withTimeout(agent.textToSpeech(cleanText), elevenConfig.timeoutMs);
+    console.log(`⏱️ ElevenLabs response time: ${Date.now() - elevenStart}ms`);
     const id = storeAudioClip(audioBuffer);
     const url = buildAudioUrl(req, id);
     // No pause here: this plays a pre-rendered audio file, not a live
@@ -343,6 +352,7 @@ async function speak(twimlNode, agent, text, req) {
     twimlNode.play(url);
     console.log('✅ Speaking via ElevenLabs:', url);
   } catch (error) {
+    console.log(`⏱️ ElevenLabs failed/timed out after: ${Date.now() - elevenStart}ms`);
     // v10: log the actual HTTP status + ElevenLabs' own error body (not just
     // error.message) so the real cause shows up in Render logs - bad API
     // key, no quota, invalid voice ID, timeout, etc. all look identical
@@ -380,8 +390,27 @@ class AuroraAgent {
       serviceType: null,
       urgencyLevel: null,
       issueDescription: null,
-      propertyAddress: null
+      // v15: address split into pieces that are merged independently
+      // (see converseAndExtract) instead of one field that gets
+      // overwritten - previously, giving the city in a later turn
+      // would wipe out a street address given earlier.
+      propertyAddressStreet: null,
+      propertyAddressCity: null,
+      propertyAddressState: null,
+      propertyAddressZip: null
     };
+  }
+
+  // v15: builds one readable address string from whatever pieces we
+  // have so far, without losing anything that's missing.
+  getFullAddress() {
+    const { propertyAddressStreet, propertyAddressCity, propertyAddressState, propertyAddressZip } = this.collectedData;
+    const parts = [];
+    if (propertyAddressStreet) parts.push(propertyAddressStreet);
+    let cityState = [propertyAddressCity, propertyAddressState].filter(Boolean).join(', ');
+    if (propertyAddressZip) cityState = cityState ? `${cityState} ${propertyAddressZip}` : propertyAddressZip;
+    if (cityState) parts.push(cityState);
+    return parts.join(', ');
   }
 
   getGreetingScript() {
@@ -398,6 +427,10 @@ class AuroraAgent {
         { role: 'user', content: userMessage }
       ];
 
+      // v15: timed, so Render logs show exactly how long Claude itself
+      // took - needed to find out where multi-second delays are coming
+      // from instead of guessing between Claude, ElevenLabs, or network.
+      const claudeStart = Date.now();
       const response = await axios.post('https://api.anthropic.com/v1/messages', {
         model: this.config.claude.model,
         max_tokens: this.config.claude.maxTokens,
@@ -409,6 +442,7 @@ class AuroraAgent {
           'anthropic-version': '2023-06-01'
         }
       });
+      console.log(`⏱️ Claude response time: ${Date.now() - claudeStart}ms`);
 
       // Don't assume the reply is content[0] - Claude sometimes puts a
       // "thinking" block first. Find the actual text block instead.
@@ -446,7 +480,12 @@ class AuroraAgent {
       if (ex.serviceType) this.collectedData.serviceType = ex.serviceType;
       if (ex.urgencyLevel) this.collectedData.urgencyLevel = ex.urgencyLevel;
       if (ex.description) this.collectedData.issueDescription = ex.description;
-      if (ex.address) this.collectedData.propertyAddress = ex.address;
+      // v15: each address piece is merged independently, so a new piece
+      // (e.g. city) never wipes out a piece learned earlier (e.g. street).
+      if (ex.addressStreet) this.collectedData.propertyAddressStreet = ex.addressStreet;
+      if (ex.addressCity) this.collectedData.propertyAddressCity = ex.addressCity;
+      if (ex.addressState) this.collectedData.propertyAddressState = ex.addressState;
+      if (ex.addressZip) this.collectedData.propertyAddressZip = ex.addressZip;
 
       // Store just the natural reply in history (not the JSON wrapper) so
       // future turns read like a normal conversation.
@@ -493,7 +532,9 @@ class AuroraAgent {
       this.collectedData.serviceType &&
       this.collectedData.urgencyLevel &&
       this.collectedData.issueDescription &&
-      this.collectedData.propertyAddress
+      this.collectedData.propertyAddressStreet &&
+      this.collectedData.propertyAddressCity &&
+      this.collectedData.propertyAddressState
     );
   }
 
@@ -519,7 +560,7 @@ class AuroraAgent {
         service_type: this.collectedData.serviceType,
         urgency_level: this.collectedData.urgencyLevel,
         issue_description: this.collectedData.issueDescription,
-        property_address: this.collectedData.propertyAddress,
+        property_address: this.getFullAddress(),
         timestamp: new Date().toISOString(),
         routing_team: (await this.determineRouting()).team,
         call_status: 'completed',
@@ -619,6 +660,18 @@ exports.handleCall = async (req, res) => {
 
     await speak(gather, agent, greeting, req);
 
+    // v15: this part of the document only runs if the Gather above times
+    // out with total silence and Twilio falls through to it - NOT on
+    // every call. (Session cleanup for a real timeout still happens the
+    // normal way, via the /voice/status callback below, so we don't
+    // delete the in-memory session here - that would wipe out the
+    // conversation memory even on calls where the gather succeeds fine.)
+    // Previously nothing followed the Gather at all, which is why a call
+    // could just go dead in silence (e.g. if someone said "hold on" and
+    // stepped away) - now it says something and hangs up cleanly instead.
+    await speak(twiml, agent, "It looks like we got disconnected. Please give us a call back whenever you're ready. Goodbye!", req);
+    twiml.hangup();
+
     console.log('✅ Sending TwiML response to Twilio');
     res.type('text/xml');
     res.send(twiml.toString());
@@ -655,6 +708,12 @@ exports.handleGatherResponse = async (req, res) => {
         action: '/voice/gather-response'
       });
       await speak(gather, agent, result.response, req);
+
+      // v15: same conditional safety net as the initial greeting - only
+      // runs if THIS Gather times out with total silence, not on every
+      // turn. No endCallSession() here for the same reason noted above.
+      await speak(twiml, agent, "It looks like we got disconnected. Please give us a call back whenever you're ready. Goodbye!", req);
+      twiml.hangup();
     }
 
     console.log('✅ Sending TwiML gather-response to Twilio');
@@ -689,7 +748,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '14.0.0',
+    version: '15.0.0',
     timestamp: new Date().toISOString()
   });
 });
