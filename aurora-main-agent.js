@@ -89,6 +89,46 @@
  *  - Everything else (JSON output shape, address rule, title logic,
  *    services list, routing, SMS, Supabase, Twilio Gather settings) is
  *    unchanged from v22.
+ *
+ * v24 CHANGES (fixes from a real ~8min test call - dead air, wrong house
+ * number, wrong city, invented wrap-up word, cost-question handling,
+ * early submission):
+ *  - Prompt: added 6 new CRITICAL blocks - never leave the caller in
+ *    silence (short spoken bridges), address capture/confirm (single
+ *    readback, clear digit speech, never invent/alter numbers), wrap-up
+ *    language template, cost/payment question handling (don't ask if
+ *    they already paid unless they said so), don't-submit-early, and
+ *    one-question-per-turn. Also a short-sampler rule for "what else do
+ *    you do" instead of dumping the full 10-service list. MuSpark
+ *    communication style section from v23 is untouched. Still no v3
+ *    model, no audio tags, no ElevenLabs model_id change (still
+ *    eleven_turbo_v2_5).
+ *  - Code: hasRequiredData() being true no longer auto-finalizes/saves
+ *    on its own. Three new checks run first:
+ *      1. holdsSubmission() - keyword check for "hold on"/"don't send"
+ *         or an unanswered cost question this turn. If matched, do NOT
+ *         save/SMS this turn - let Claude's own (prompt-governed) reply
+ *         stand and keep collecting.
+ *      2. checkHouseNumberMismatch() - the house number in
+ *         propertyAddressStreet must have actually been heard from the
+ *         caller at some point in the call (tracked via rawDigitsHeard,
+ *         appended every turn in converseAndExtract). If it was never
+ *         actually said, don't save it - ask instead. This is what
+ *         catches Claude silently turning "457" into "67".
+ *      3. buildWrapUpLine() - the final spoken summary (and everything
+ *         saved to Supabase/texted) is now composed in code directly
+ *         from collectedData, never from Claude's own free-form text for
+ *         that turn. This is what stops an invented word like "roofing
+ *         week" or a wrong city from ever going out - Claude's paraphrase
+ *         is no longer trusted for the closing line, only the structured
+ *         fields already merged and confirmed earlier in the call.
+ *  - Latency: no code change needed here - the successful-audio path
+ *    already has no artificial pause before playing ElevenLabs audio
+ *    (only the failure/fallback path pauses before the Twilio voice
+ *    speaks), and both Claude and ElevenLabs calls are already timed and
+ *    logged. A real end-to-end latency fix (streaming) is a separate,
+ *    bigger change, not done here - the new "short bridge" prompt lines
+ *    address the *perception* of dead air, not the underlying latency.
  */
 
 const twilio = require('twilio');
@@ -236,6 +276,50 @@ CRITICAL - THIS IS A LIVE PHONE CALL, NOT A CHAT WINDOW:
 - Prefer the turn shape: short ack, short reflect, one question. Do not give speeches.
 
 CRITICAL - ADDRESS RULE: Before asking any address-related question, re-read the ENTIRE conversation so far. If the caller has already told you the street, the city, the state, or the zip code - even just once, even several turns ago - NEVER ask for that piece again. Only ask for the SPECIFIC piece you're still missing (for example, if you have the street but not the city, ask only "What city and state is that in?" - do not re-ask for the whole address). If the caller has given you the complete address already, do not ask about it again at all - move on.
+
+CRITICAL - NEVER LEAVE THE CALLER IN SILENCE:
+- If you need a moment to think or lock details, say a short bridge first: "Got it - one sec." or "Got you - locking that in."
+- Prefer 1-3 short sentences. Long replies make the next gap feel worse.
+- Do not leave the caller with nothing while you "prepare" a long speech.
+
+CRITICAL - ADDRESS CAPTURE AND CONFIRM:
+- Prefer collecting street first, then city/state/zip. Re-read the whole conversation before asking - never re-ask a piece already given (existing rule stays).
+- When you have street + city + state + zip, read back ONCE as one block before wrapping up.
+- For house number and zip in readbacks, speak digits clearly (four five seven... seven seven six four zero) so they cannot collapse (never turn 457 into 67).
+- If the caller says the readback is wrong: ask ONLY the wrong field. Do not re-ask confirmed pieces.
+- NEVER invent, shorten, or alter house numbers, street names, cities, states, or zips.
+- If a city might be misheard (e.g. Beaumont vs Belmont), clarify with a choice: "Beaumont or Belmont?"
+- Wrap-up and any "I've got..." lines MUST use the same address pieces already confirmed - do not paraphrase into a new address.
+
+CRITICAL - WRAP-UP LANGUAGE:
+- When summarizing the case, stick to known fields only.
+- Allowed shape: "So to wrap up, [title last name] - I've got your [service description] marked as [urgency] at [street], [city], [state] [zip]. Our team will call you shortly."
+- service description examples: "roofing leak", "emergency roofing case" - NEVER invent words like "roofing week".
+- Do not change city/street/number in the wrap-up from what was confirmed.
+
+CRITICAL - COST AND PAYMENT QUESTIONS:
+- If the caller asks about pricing, cost, who pays, or how they pay:
+  Lead with: "Got you."
+  Reflect: "You're asking what this costs and how payment works."
+  Answer briefly: "There's no charge for this call. We set up a free inspection, then you get a repair estimate before any work. A lot of storm or leak jobs go through insurance - the team will walk you through that on the callback."
+  Then ONE question: "Want me to note that you want cost and insurance options explained when they call?"
+- NEVER ask if they already paid unless they said they already paid.
+- After a clear "No," do not add a second assumption in the same reply.
+
+CRITICAL - DO NOT SEND THE CASE EARLY:
+- Do not say you are sending / submitting / dispatching the case until:
+  (a) address has been confirmed, AND
+  (b) the caller is not mid-question about cost, timing, or saying hold on.
+- If they say "hold on", "don't send yet", or ask more questions: "Got you - I won't send it yet. What do you want to cover first?"
+
+CRITICAL - ONE QUESTION PER TURN:
+- Ask exactly one question per reply.
+- Do not stack two questions ("What's going on today? What can I help you with?").
+- Prefer "Got you" on confused, emotional, or "hold on" turns; "Got it" is fine for simple facts.
+- Ban stiff lines like "Who do I have the pleasure of speaking with today?" - use "Got you - and your name?" only if name is still missing.
+- Do not call the customer "dear."
+
+If they ask what else you do besides roofing: give a SHORT sampler (tarping, water damage, cabinets, a few others), then ask what else is going on. Do not dump the full 10-service catalog unless they ask for the full list.
 
 CRITICAL - OUTPUT FORMAT:
 You must respond with ONLY a single valid JSON object, nothing else - no text before or after it, no markdown code fences. The shape is exactly:
@@ -425,6 +509,12 @@ class AuroraAgent {
       propertyAddressState: null,
       propertyAddressZip: null
     };
+    // v24: every digit sequence the caller has actually said, across the
+    // whole call (raw Twilio SpeechResult text, turn by turn) - used to
+    // sanity-check that a house number Claude wrote down was actually
+    // spoken by the caller at some point, not misheard/invented. See
+    // checkHouseNumberMismatch().
+    this.rawDigitsHeard = [];
   }
 
   // v15: builds one readable address string from whatever pieces we
@@ -447,6 +537,12 @@ class AuroraAgent {
   // from the extracted fields in the same response. Replaces the old
   // two-call (generateResponse + extractDataFromMessage) approach.
   async converseAndExtract(userMessage) {
+    // v24: record every digit sequence the caller actually said this turn
+    // (house numbers, zips, phone digits, whatever) - checkHouseNumberMismatch()
+    // uses this later to sanity-check the house number Claude wrote down.
+    const digitsThisTurn = (userMessage || '').match(/\d+/g);
+    if (digitsThisTurn) this.rawDigitsHeard.push(...digitsThisTurn);
+
     try {
       const messages = [
         ...this.conversationHistory,
@@ -564,6 +660,78 @@ class AuroraAgent {
     );
   }
 
+  // v24: real test call caught Claude reading back "67" when the caller
+  // had actually said "457" - the extraction silently corrupted the
+  // number. This is a safety net, not a fix to the extraction itself:
+  // before we're willing to finalize/save, check that the house number
+  // sitting in propertyAddressStreet was actually said by the caller at
+  // SOME point in the call (rawDigitsHeard, tracked in converseAndExtract).
+  // If it was never actually heard, don't save it - ask instead.
+  // Returns a clarifying question string if something looks wrong, or
+  // null if it's fine to proceed.
+  checkHouseNumberMismatch() {
+    const street = this.collectedData.propertyAddressStreet;
+    if (!street) return null;
+    const storedMatch = street.match(/^(\d+)/);
+    if (!storedMatch) return null; // no leading number to check (unusual, but not our job to block on)
+    const storedNumber = storedMatch[1];
+
+    // Nothing to cross-check against yet (e.g. Twilio's speech-to-text
+    // returned the number as words, not digits, somewhere) - don't block
+    // on a check we can't actually perform.
+    if (this.rawDigitsHeard.length === 0) return null;
+
+    if (!this.rawDigitsHeard.includes(storedNumber)) {
+      return "Before I lock this in - can you say the house number for me one more time, just the numbers?";
+    }
+    return null;
+  }
+
+  // v24: readable label per service, used only for the code-generated
+  // wrap-up line below - keeps the final summary honest instead of
+  // trusting Claude's own free-form paraphrase to get the service right.
+  static SERVICE_LABELS = {
+    roofing: 'roofing',
+    tarping: 'tarping',
+    tree: 'tree removal',
+    exterior: 'exterior',
+    interior: 'interior',
+    waterproofing: 'waterproofing',
+    armor: 'armor plating',
+    newbuild: 'new build',
+    millwork: 'millwork',
+    solar: 'solar'
+  };
+
+  // v24: the actual fix for "roofing week" and the wrong-city wrap-up -
+  // this builds the final case summary entirely from collectedData (the
+  // merged, confirmed session fields), never from Claude's own free-form
+  // text for that turn. Matches the WRAP-UP LANGUAGE rule in the prompt,
+  // but enforced in code so it can't drift or invent a word.
+  buildWrapUpLine() {
+    const { serviceType, urgencyLevel, issueDescription } = this.collectedData;
+    const label = AuroraAgent.SERVICE_LABELS[serviceType] || 'service';
+    const urgencyText = urgencyLevel ? urgencyLevel.toLowerCase() : 'routine';
+    const address = this.getFullAddress();
+    const caseDescription = issueDescription ? `${label} - ${issueDescription}` : `${label} case`;
+    return `So to wrap up - I've got your ${caseDescription} marked as ${urgencyText} at ${address}. Our team will call you shortly. Thank you for choosing Warm Home!`;
+  }
+
+  // v24: code-level backstop for the "DO NOT SEND THE CASE EARLY" prompt
+  // rule - a real test call showed Amy starting to wrap up/submit while
+  // the caller was still mid-question about cost. This is a plain keyword
+  // heuristic, not true intent understanding, so it can be loosened later
+  // if it ever holds a call that should have gone through - but the cost
+  // of a false hold (one extra turn) is much lower than the cost of a
+  // false finalize (case submitted while the caller's still talking).
+  static holdsSubmission(userMessage) {
+    if (!userMessage) return false;
+    const text = userMessage.toLowerCase();
+    const askedToWait = /\b(hold on|hold up|wait|don'?t send|not yet|one second|one sec|give me a (sec|second|minute))\b/.test(text);
+    const askingAboutCost = /\b(cost|price|pricing|how much|pay|payment|insurance|deductible|afford)\b/.test(text) && text.includes('?');
+    return askedToWait || askingAboutCost;
+  }
+
   async determineRouting() {
     const urgency = this.collectedData.urgencyLevel;
     const service = this.collectedData.serviceType;
@@ -643,7 +811,38 @@ class AuroraAgent {
     }
 
     if (this.hasRequiredData()) {
-      response += " I've got everything I need - our team will reach out within the timeframe I mentioned. Thank you for choosing Warm Home!";
+      // v24: don't finalize on a turn where the caller is still mid-question
+      // about cost/payment, or explicitly asked us to hold off - a real
+      // test call caught Amy announcing she was submitting the case while
+      // the caller was still asking who pays. Claude's own reply this turn
+      // already handles the cost question / hold request per the prompt
+      // rules - just don't let the code finalize underneath that reply.
+      if (AuroraAgent.holdsSubmission(userMessage)) {
+        return {
+          response,
+          status: 'collecting_data',
+          dataCollected: this.collectedData
+        };
+      }
+
+      // v24: sanity-check the house number before trusting it enough to
+      // save/text it out. If it doesn't check out, ask instead of saving -
+      // this replaces Claude's own turn reply with a direct clarifying
+      // question for this turn only.
+      const mismatchQuestion = this.checkHouseNumberMismatch();
+      if (mismatchQuestion) {
+        return {
+          response: mismatchQuestion,
+          status: 'collecting_data',
+          dataCollected: this.collectedData
+        };
+      }
+
+      // v24: the closing line is now built entirely from collectedData
+      // (buildWrapUpLine), not from whatever Claude free-formed this turn -
+      // this is what stops an invented word ("roofing week") or a wrong
+      // city from ever reaching the caller or Supabase.
+      response = this.buildWrapUpLine();
       await this.saveInquiryData();
       await this.sendSMSConfirmation();
       return {
@@ -774,7 +973,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '23.0.0',
+    version: '24.0.0',
     timestamp: new Date().toISOString()
   });
 });
