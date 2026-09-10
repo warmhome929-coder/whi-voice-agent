@@ -129,6 +129,19 @@
  *    logged. A real end-to-end latency fix (streaming) is a separate,
  *    bigger change, not done here - the new "short bridge" prompt lines
  *    address the *perception* of dead air, not the underlying latency.
+ *
+ * v25 CHANGES (greeting + reassurance placement):
+ *  - Greeting shortened to a low-key open: "Thanks for calling Warm Home.
+ *    This is Amy. What's going on today?" No reassurance, no name/number
+ *    ask in the greeting itself anymore.
+ *  - New CRITICAL - OPENING SEQUENCE prompt block: reassurance ("I'm
+ *    glad you reached out - you're in good hands") and the name/number
+ *    ask both move to Amy's FIRST reply after the caller actually
+ *    states their problem/service, not the opening line - so it lands
+ *    right after she knows what's wrong, not before. Skips the
+ *    name/number ask if already given by that point. PRIMARY GOAL step 1
+ *    updated to match (no longer says "get the name right away").
+ *  - No code changes this version - prompt/greeting text only.
  */
 
 const twilio = require('twilio');
@@ -257,7 +270,7 @@ WARM HOME INC. SERVICES (10 Total):
 10. Solar - Solar panel installation and related services
 
 YOUR PRIMARY GOAL IN THIS CALL:
-1. Greet warmly and professionally, and get the caller's name right away, before asking about their issue
+1. Greet warmly and professionally with a short, low-key opening - ask what's going on rather than leading with reassurance or asking for their name yet (see CRITICAL - OPENING SEQUENCE below for exactly when reassurance and the name/number ask happen)
 2. Listen and understand the customer's situation completely
 3. Ask clarifying questions to identify the service needed
 4. Assess urgency level (EMERGENCY / URGENT / ROUTINE)
@@ -267,6 +280,13 @@ YOUR PRIMARY GOAL IN THIS CALL:
 8. End call by saving their data and routing to appropriate team
 
 When speaking to the caller, refer to the company as "Warm Home" - never say "Warm Home Inc." out loud, that's only the legal name.
+
+CRITICAL - OPENING SEQUENCE:
+- The opening greeting is short and low-key on purpose - do NOT say "I'm glad you reached out" or "you're in good hands" in the opening greeting itself. That reassurance is saved for right after they tell you what's wrong, where it means more.
+- On your FIRST reply after the caller names their problem or the service they need, use this shape: "Got you." + brief empathy if it's storm/leak/damage-related + "I'm glad you reached out - you're in good hands." + ONE ask for their name and number (only if not already collected).
+  Example: "Got you. That sounds stressful with water getting in. I'm glad you reached out - you're in good hands. Can I get your name and number so I can help you properly?"
+- If they already gave their name and/or number before this point, skip that part of the ask and move straight to the next missing field instead.
+- After this first reply, go back to the normal one-question-per-turn rule for the rest of the call.
 
 CRITICAL - THIS IS A LIVE PHONE CALL, NOT A CHAT WINDOW:
 - Everything you write is read aloud by a text-to-speech voice. The caller cannot see text.
@@ -530,7 +550,7 @@ class AuroraAgent {
   }
 
   getGreetingScript() {
-    return "Thanks for calling Warm Home. This is Amy. I'm glad you reached out — you're in good hands. What's going on, and could I get your name and number so I can address you properly?";
+    return "Thanks for calling Warm Home. This is Amy. What's going on today?";
   }
 
   // SINGLE Claude call: returns the spoken reply AND updates collectedData
@@ -973,7 +993,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '24.0.0',
+    version: '25.0.0',
     timestamp: new Date().toISOString()
   });
 });
