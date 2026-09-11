@@ -550,6 +550,62 @@
  *  - No changes to JSON output shape, roles, services list, titles,
  *    NEVER/ALWAYS lists, routing, SMS/Supabase logic, or the four
  *    protected Gather settings on the main mid-call Gather.
+ *
+ * v37 CHANGES (Address Lock FSM - real bug caught on a full call transcript,
+ * not just a spec relayed secondhand):
+ *  - Root cause, diagnosed from a real ~4min call transcript Joseph shared:
+ *    Claude's own extraction rewrote "456 Sylvan Street" to "4567 Sullivan
+ *    Street" - despite the explicit v33/v34/v36 "never alter a street name
+ *    or number" prompt rules - and then the existing v24 house-number
+ *    safety net (checkHouseNumberMismatch) correctly caught that "4567" was
+ *    never actually said, but had no exit: it just repeated the identical
+ *    "before I lock this in... just the numbers?" question 3+ times with
+ *    no cap, while never checking the STREET NAME at all - so "Sullivan"
+ *    sailed through completely unverified the whole time.
+ *  - New this version: this is now a code-level check, not just a prompt
+ *    rule - prompt text alone already proved it wasn't holding under this
+ *    exact pressure.
+ *  - New this.rawSpeechHeard (parallel to the existing rawDigitsHeard):
+ *    every full raw thing the caller said this call, turn by turn.
+ *  - New wasActuallySaid(word)/streetNameLooksWrong(): checks whether the
+ *    street NAME Claude wrote down was actually said by the caller at some
+ *    point (direct substring match, or letters-mashed-together match so
+ *    bare-letter spelling like "S Y L V A N" still counts) - same
+ *    heuristic-backstop philosophy as the existing house-number check, now
+ *    covering the other half of the address.
+ *  - houseNumberLooksWrong() is the same logic as the old
+ *    checkHouseNumberMismatch(), refactored to return a boolean so it can
+ *    be combined with the new street-name check.
+ *  - New checkAddressBeforeLock() - the actual "Address Lock FSM": verifies
+ *    both the number and the name, and once BOTH check out, sets
+ *    this.addressLocked = true and never re-checks or re-asks about the
+ *    address again for the rest of the call, per Joseph's own diagnosis
+ *    ("store raw street/number, read back verbatim, one confirm, then
+ *    forbid more address asks"). Replaces the old checkHouseNumberMismatch
+ *    call site in handleConversation.
+ *  - Bounded retries, closing the actual loop bug: attempt 1 asks a
+ *    targeted question (number, name, or both, whichever is wrong);
+ *    attempt 2 switches tactics entirely and asks for a letter-by-letter
+ *    spelling of the street name (same technique already proven for last
+ *    names) instead of repeating the same line; attempt 3 stops blocking
+ *    the call and accepts what we have (logged clearly to Render as
+ *    "gave up after N attempts... accepting unverified") rather than trap
+ *    the caller the way the real call got stuck.
+ *  - One small prompt reinforcement: the same transcript showed Amy
+ *    inventing an unrelated two-way choice ("Main Street or Oak Street?")
+ *    when the caller had actually said "Sylvan" - added one line to the
+ *    existing city/zip disambiguation-choice rule making clear that a
+ *    choice is only for two things plausibly actually heard, never an
+ *    invented placeholder pair.
+ *  - Did NOT touch: the field names or shape of collectedData, the JSON
+ *    output/tool schema, hasRequiredData(), buildWrapUpLine(), the
+ *    ready_to_route/isCallerClosing hangup paths, PHONE CONFIRM, HANG-UP
+ *    PACING, or any other prompt CRITICAL block - this is mostly a new,
+ *    additive code-level safety net sitting in front of the same
+ *    finalize/save/SMS path that already existed.
+ *  - No changes to JSON output shape, roles, services list, titles,
+ *    NEVER/ALWAYS lists, routing, SMS/Supabase logic, ElevenLabs settings,
+ *    or the four protected Gather settings on the main mid-call Gather.
  */
 
 const twilio = require('twilio');
@@ -791,6 +847,7 @@ CRITICAL - ADDRESS CAPTURE AND CONFIRM:
 - If the caller says the readback is wrong: ask ONLY the wrong field. Do not re-ask confirmed pieces or the whole address.
 - NEVER invent, shorten, or alter house numbers, street names, cities, states, or zips.
 - If a city or zip might be misheard (e.g. Beaumont vs Belmont), clarify with a choice: "Beaumont or Belmont?"
+- Never invent a two-way choice out of names the caller never said (for example, asking "Main Street or Oak Street?" when the caller actually said "Sylvan") - a disambiguation choice is only for two things you plausibly actually heard, never a guess or a generic placeholder pair. If you're not sure what street name you heard, ask them to repeat or spell it instead of offering a made-up choice.
 - LOCK RULE: once a field is confirmed or corrected (for example, the caller says "Beaumont" and you clarify it as Beaumont, or "77640" for the zip), that value is LOCKED for the rest of the call - never revert to an earlier, wrong value later (do not say "Belmont" again after the caller has confirmed "Beaumont"). Never invent or alter a house number, street name, city, state, or zip on your own - only use what the caller actually said.
 - Wrap-up and any "I've got..." lines MUST use the same address pieces already confirmed - do not paraphrase into a new address.
 
@@ -1083,6 +1140,25 @@ class AuroraAgent {
     // spoken by the caller at some point, not misheard/invented. See
     // checkHouseNumberMismatch().
     this.rawDigitsHeard = [];
+    // v37: every full raw thing the caller has said this call (Twilio
+    // SpeechResult text, turn by turn) - used by wasActuallySaid() to
+    // sanity-check that a street NAME Claude wrote down was actually said
+    // by the caller, not substituted for a more common-sounding word (the
+    // real "Sylvan" -> "Sullivan" bug from a real test call - see
+    // checkStreetNameMismatch()/checkAddressBeforeLock() below).
+    this.rawSpeechHeard = [];
+    // v37: once the address has passed the checks below and been locked,
+    // never re-run them again and never ask about the address again for
+    // the rest of the call - this is the "Address Lock FSM" idea from
+    // Joseph's QA: verify once, lock it, then leave it alone.
+    this.addressLocked = false;
+    // v37: bounded retry counter for the address confirm gate below - a
+    // real call got stuck repeating "before I lock this in, just the
+    // numbers?" 3+ times in a row with no way out. This caps it: after a
+    // couple of failed attempts we stop repeating the same question and
+    // switch tactics (letter-by-letter spelling), and after that we stop
+    // blocking the call entirely rather than trap the caller forever.
+    this.addressConfirmAttempts = 0;
   }
 
   // v15: builds one readable address string from whatever pieces we
@@ -1110,6 +1186,10 @@ class AuroraAgent {
     // uses this later to sanity-check the house number Claude wrote down.
     const digitsThisTurn = (userMessage || '').match(/\d+/g);
     if (digitsThisTurn) this.rawDigitsHeard.push(...digitsThisTurn);
+    // v37: record the full raw turn too (not just digits) - checkStreetNameMismatch()/
+    // wasActuallySaid() uses this to verify a street name Claude wrote down
+    // was actually said by the caller, not substituted for a different word.
+    if (userMessage) this.rawSpeechHeard.push(userMessage);
 
     try {
       const messages = [
@@ -1245,25 +1325,113 @@ class AuroraAgent {
   // before we're willing to finalize/save, check that the house number
   // sitting in propertyAddressStreet was actually said by the caller at
   // SOME point in the call (rawDigitsHeard, tracked in converseAndExtract).
-  // If it was never actually heard, don't save it - ask instead.
-  // Returns a clarifying question string if something looks wrong, or
-  // null if it's fine to proceed.
-  checkHouseNumberMismatch() {
+  // Returns true if it looks wrong (never actually heard), false if it's
+  // fine or there's nothing to check.
+  houseNumberLooksWrong() {
     const street = this.collectedData.propertyAddressStreet;
-    if (!street) return null;
+    if (!street) return false;
     const storedMatch = street.match(/^(\d+)/);
-    if (!storedMatch) return null; // no leading number to check (unusual, but not our job to block on)
+    if (!storedMatch) return false; // no leading number to check (unusual, but not our job to block on)
     const storedNumber = storedMatch[1];
-
     // Nothing to cross-check against yet (e.g. Twilio's speech-to-text
     // returned the number as words, not digits, somewhere) - don't block
     // on a check we can't actually perform.
-    if (this.rawDigitsHeard.length === 0) return null;
+    if (this.rawDigitsHeard.length === 0) return false;
+    return !this.rawDigitsHeard.includes(storedNumber);
+  }
 
-    if (!this.rawDigitsHeard.includes(storedNumber)) {
-      return "Before I lock this in - can you say the house number for me one more time, just the numbers?";
+  // v37: same idea as houseNumberLooksWrong, but for the street NAME - a
+  // real test call showed Claude confidently rewriting "Sylvan" to
+  // "Sullivan" (and the number 456 to 4567) even though the CRITICAL -
+  // Street name fidelity prompt rule explicitly forbids it. Prompt text
+  // alone wasn't holding under that pressure, so this is the code-level
+  // backstop: does the street-name word actually appear anywhere in what
+  // the caller said this call?
+  wasActuallySaid(word) {
+    if (!word) return true; // nothing to check
+    const clean = word.toLowerCase().replace(/[^a-z]/g, '');
+    if (!clean) return true;
+    const joined = this.rawSpeechHeard.join(' ').toLowerCase();
+    if (joined.includes(clean)) return true;
+    // Also check with spaces stripped, so bare-letter spelling ("S A A D
+    // E" or "S Y L V A N") still matches even though it never appears as
+    // one contiguous word in the raw SpeechResult text.
+    const lettersOnly = joined.replace(/[^a-z]/g, '');
+    return lettersOnly.includes(clean);
+  }
+
+  streetNameLooksWrong() {
+    const street = this.collectedData.propertyAddressStreet;
+    if (!street) return false;
+    if (this.rawSpeechHeard.length === 0) return false; // nothing to check against
+    // Strip the leading house number and a trailing street-type word
+    // (street/st/road/rd/avenue/ave/drive/dr/lane/ln/court/ct/way/
+    // boulevard/blvd) to isolate just the NAME part, e.g. "456 Sylvan
+    // Street" -> "Sylvan".
+    const nameOnly = street
+      .replace(/^\d+\s*/, '')
+      .replace(/\b(street|st|road|rd|avenue|ave|drive|dr|lane|ln|court|ct|way|boulevard|blvd|place|pl|circle|cir)\.?\s*$/i, '')
+      .trim();
+    if (!nameOnly) return false;
+    // Check each word of the name (handles multi-word names like "Oak
+    // Ridge") - if EVERY word was actually said, it's fine; if any word
+    // was never said, treat the whole thing as suspect.
+    return !nameOnly.split(/\s+/).every(word => this.wasActuallySaid(word));
+  }
+
+  // v37: the "Address Lock FSM" from Joseph's QA - verify the address
+  // ONCE, lock it, then never ask about it again. Replaces the old
+  // checkHouseNumberMismatch() call site with a combined gate that also
+  // checks the street NAME (not just the number), and - critically - is
+  // now bounded. A real call got stuck repeating the old check's identical
+  // clarifying question 3+ times with no way out, because the underlying
+  // corrupted value never actually got fixed by a plain re-ask. This gate
+  // counts attempts and escalates: first miss, ask a targeted question;
+  // second miss, switch to letter-by-letter spelling (much higher
+  // fidelity than free speech, same technique already proven for last
+  // names); third miss, stop blocking the call - lock whatever we have
+  // rather than trap the caller in an infinite loop, since getting the
+  // call to finish is more important than a third failed verification
+  // attempt at that point.
+  // Returns a clarifying question string if the caller should be asked
+  // something before we finalize, or null if it's fine to proceed
+  // (locking the address as a side effect the first time it passes).
+  checkAddressBeforeLock() {
+    if (this.addressLocked) return null; // already verified - never re-check or re-ask
+    const numberWrong = this.houseNumberLooksWrong();
+    const nameWrong = this.streetNameLooksWrong();
+
+    if (!numberWrong && !nameWrong) {
+      this.addressLocked = true;
+      return null;
     }
-    return null;
+
+    this.addressConfirmAttempts++;
+
+    if (this.addressConfirmAttempts >= 3) {
+      // Bounded fallback: we tried a targeted re-ask, then a spelling
+      // fallback, and it's still not resolving - accept what we have and
+      // move on rather than loop forever. Logged clearly so this is
+      // visible in Render logs if it ever fires on a real call.
+      console.warn(`⚠️ Address lock gate gave up after ${this.addressConfirmAttempts} attempts - accepting "${this.collectedData.propertyAddressStreet}" unverified to avoid trapping the caller.`);
+      this.addressLocked = true;
+      return null;
+    }
+
+    if (this.addressConfirmAttempts === 1) {
+      if (numberWrong && nameWrong) {
+        return "Before I lock this in - can you say the full street address one more time for me, nice and slow?";
+      } else if (numberWrong) {
+        return "Before I lock this in - can you say the house number for me one more time, just the numbers?";
+      } else {
+        return "I want to make sure I have the street name exactly right - can you say just the street name one more time for me?";
+      }
+    }
+
+    // Second miss: switch tactics instead of repeating the same question -
+    // ask for a letter-by-letter spelling, same technique already used for
+    // last names.
+    return "I want to get this exactly right - can you spell the street name for me, one clear letter at a time, like S as in Sam?";
   }
 
   // v24: readable label per service, used only for the code-generated
@@ -1442,11 +1610,13 @@ class AuroraAgent {
         };
       }
 
-      // v24: sanity-check the house number before trusting it enough to
-      // save/text it out. If it doesn't check out, ask instead of saving -
-      // this replaces Claude's own turn reply with a direct clarifying
-      // question for this turn only.
-      const mismatchQuestion = this.checkHouseNumberMismatch();
+      // v24/v37: sanity-check the address (house number AND street name)
+      // before trusting it enough to save/text it out. If it doesn't check
+      // out, ask instead of saving - this replaces Claude's own turn reply
+      // with a direct clarifying question for this turn only. v37: bounded
+      // and now also checks the street name, not just the number - see
+      // checkAddressBeforeLock() above.
+      const mismatchQuestion = this.checkAddressBeforeLock();
       if (mismatchQuestion) {
         return {
           response: mismatchQuestion,
@@ -1679,7 +1849,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '36.0.0',
+    version: '37.0.0',
     timestamp: new Date().toISOString()
   });
 });
