@@ -403,6 +403,56 @@
  *  - No changes to JSON output shape, address rules, title/services logic,
  *    routing, SMS, Supabase, ElevenLabs settings, or the four protected
  *    Gather settings.
+ *
+ * v34 CHANGES (the real root cause behind repeated name/address/re-ask
+ * bugs - diagnosed from live Render logs, not another prompt guess):
+ *  - Joseph sent actual production logs showing "JSON parse failed, using
+ *    raw text as reply" firing on nearly every turn of a real call, with
+ *    Claude's raw response being plain conversational text ("Okay, I
+ *    go...") instead of the required JSON object. On every turn that
+ *    happens, extraction was SKIPPED ENTIRELY that turn (by design, as a
+ *    graceful fallback) - meaning collectedData never got updated, the
+ *    call could never reach hasRequiredData()/ready_to_route, and none of
+ *    the code-level backstops (house-number check, wrap-up builder) ever
+ *    ran. This is almost certainly the real explanation behind several of
+ *    the "she gets the name/address wrong" and "keeps asking again"
+ *    reports from earlier rounds, not a prompt-wording problem.
+ *  - Root cause: the Messages API has no native "always valid JSON" mode
+ *    for free-text replies - it was entirely dependent on Claude following
+ *    the CRITICAL - OUTPUT FORMAT text instruction, buried after many
+ *    other CRITICAL rules in a system prompt that's grown very large
+ *    across v22-v33. That's apparently not holding reliably anymore.
+ *  - Fix: new AURORA_RESPONSE_TOOL (defined right after the system prompt)
+ *    and tool_choice forcing Claude to answer through it. This makes
+ *    freeform non-JSON replies structurally impossible - Claude can only
+ *    respond by filling in the tool's schema, and Anthropic hands back
+ *    that input already parsed as a JS object, so there's no JSON.parse
+ *    step left to fail. Field names are EXACTLY the same as before
+ *    (reply/extracted.{name,phone,email,serviceType,urgencyLevel,
+ *    description,addressStreet,addressCity,addressState,addressZip}) -
+ *    this changes the transport mechanism only, not the JSON shape Joseph
+ *    said not to touch.
+ *  - Kept the old text-block JSON path as a defensive fallback (should be
+ *    rare now with tool_choice forced) so a one-off oddity still degrades
+ *    gracefully to "speak the raw text, skip extraction this turn" instead
+ *    of losing the turn - same behavior as before v34 in that edge case.
+ *  - CRITICAL - OUTPUT FORMAT prompt text updated to describe calling the
+ *    tool instead of writing raw JSON - field-level detail (enums, null
+ *    handling) now lives primarily in the tool schema itself, which Claude
+ *    reads directly when filling in a forced tool call.
+ *  - Self-tested against mocked API responses before shipping (no live
+ *    Anthropic key available in this environment): (1) the new tool_use
+ *    path extracts correctly and the request actually includes tools/
+ *    tool_choice, (2) the fallback text-JSON path still works if no
+ *    tool_use block comes back, (3) the exact original bug scenario (plain
+ *    text "Okay, I go...") still degrades gracefully without crashing,
+ *    (4) a response with no usable blocks at all is caught without
+ *    crashing the call. All 4 passed. This has NOT been tested against a
+ *    live call yet - worth confirming on the next real test call that the
+ *    "JSON parse failed" log line stops appearing.
+ *  - No changes to address/name prompt rules, title/services logic,
+ *    routing, SMS, Supabase, ElevenLabs settings, or Twilio Gather
+ *    settings.
  */
 
 const twilio = require('twilio');
@@ -686,22 +736,60 @@ CRITICAL - MATCH THE CALLER'S EMOTIONAL STATE:
 If they ask what else you do besides roofing: give a SHORT sampler (tarping, water damage, cabinets, a few others), then ask what else is going on. Do not dump the full 10-service catalog unless they ask for the full list.
 
 CRITICAL - OUTPUT FORMAT:
-You must respond with ONLY a single valid JSON object, nothing else - no text before or after it, no markdown code fences. The shape is exactly:
-{
-  "reply": "<what you say out loud next, following all the voice-call rules above>",
-  "extracted": {
-    "name": "<customer's name if mentioned this call so far, else null>",
-    "phone": "<phone number as XXX-XXX-XXXX if mentioned, else null>",
-    "email": "<email if mentioned, else null>",
-    "serviceType": "<one of: roofing, tarping, tree, exterior, interior, waterproofing, armor, newbuild, millwork, solar - only if clearly identified, else null>",
-    "urgencyLevel": "<EMERGENCY, URGENT, or ROUTINE if you can judge it from what's been said, else null>",
-    "description": "<brief description of their issue if known, else null>",
-    "addressStreet": "<street number and street name only, e.g. '7007 Veterans Boulevard', if mentioned this call so far (this turn or an earlier turn), else null>",
-    "addressCity": "<city if mentioned this call so far, else null>",
-    "addressState": "<state if mentioned this call so far, else null>",
-    "addressZip": "<zip code if mentioned this call so far, else null>"
+Always give your answer by calling the respond_to_caller tool - never answer in plain text. It takes exactly two things, same as before:
+- reply: what you say out loud next, following all the voice-call rules above.
+- extracted: whatever of name, phone, email, serviceType, urgencyLevel, description, addressStreet, addressCity, addressState, addressZip have been mentioned THIS CALL so far (this turn or an earlier turn) - leave a field out entirely if it hasn't been mentioned, never guess or invent a value. Full details on each field (allowed values, formatting) are in the tool's own schema.`;
+
+// v34: forces the model's reply through a tool call instead of hoping it
+// writes valid JSON in a plain text block. Render logs from a real call
+// showed "JSON parse failed, using raw text as reply" firing on nearly
+// every turn - Claude was replying in plain conversational text ("Okay, I
+// go...") instead of the required JSON object. The Messages API has no
+// native "always valid JSON" mode for free-text output, so with a system
+// prompt this large (many CRITICAL rules), the OUTPUT FORMAT instruction
+// was apparently not holding reliably. tool_choice forcing this exact tool
+// makes that structurally impossible - Claude can only respond by filling
+// in this schema, so there's no free-form JSON text to get wrong. Field
+// names are UNCHANGED from the original reply/extracted shape - only the
+// transport mechanism changed, not the shape itself.
+const AURORA_RESPONSE_TOOL = {
+  name: 'respond_to_caller',
+  description: 'Give your next spoken reply to the caller, plus whatever caller details have been mentioned THIS CALL so far (this turn or an earlier turn). Always respond by calling this tool - never plain text.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      reply: {
+        type: 'string',
+        description: 'What you say out loud next, following all the voice-call rules in the system prompt above (short, natural, plain speech, one question at a time, etc).'
+      },
+      extracted: {
+        type: 'object',
+        description: 'Caller details mentioned THIS CALL so far. Leave a field out entirely if it has not been mentioned yet - never guess or invent a value.',
+        properties: {
+          name: { type: 'string', description: "Customer's name, if mentioned this call so far." },
+          phone: { type: 'string', description: 'Phone number as XXX-XXX-XXXX, if mentioned.' },
+          email: { type: 'string', description: 'Email address, if mentioned.' },
+          serviceType: {
+            type: 'string',
+            enum: ['roofing', 'tarping', 'tree', 'exterior', 'interior', 'waterproofing', 'armor', 'newbuild', 'millwork', 'solar'],
+            description: 'Only if clearly identified.'
+          },
+          urgencyLevel: {
+            type: 'string',
+            enum: ['EMERGENCY', 'URGENT', 'ROUTINE'],
+            description: "If you can judge it from what's been said."
+          },
+          description: { type: 'string', description: "Brief description of the caller's issue, if known." },
+          addressStreet: { type: 'string', description: "Street number and street name only, e.g. '7007 Veterans Boulevard', if mentioned this call so far." },
+          addressCity: { type: 'string', description: 'City, if mentioned this call so far.' },
+          addressState: { type: 'string', description: 'State, if mentioned this call so far.' },
+          addressZip: { type: 'string', description: 'Zip code, if mentioned this call so far.' }
+        }
+      }
+    },
+    required: ['reply', 'extracted']
   }
-}`;
+};
 
 // ============================================
 // SPEECH SANITIZATION
@@ -921,7 +1009,14 @@ class AuroraAgent {
         model: this.config.claude.model,
         max_tokens: this.config.claude.maxTokens,
         system: AURORA_SYSTEM_PROMPT,
-        messages: messages
+        messages: messages,
+        // v34: force the reply through AURORA_RESPONSE_TOOL instead of
+        // hoping Claude writes valid JSON in a plain text block - see the
+        // comment on AURORA_RESPONSE_TOOL above for why (a real call's
+        // Render logs showed the old text-JSON approach failing on nearly
+        // every turn).
+        tools: [AURORA_RESPONSE_TOOL],
+        tool_choice: { type: 'tool', name: AURORA_RESPONSE_TOOL.name }
       }, {
         headers: {
           'x-api-key': this.config.claude.apiKey,
@@ -930,32 +1025,36 @@ class AuroraAgent {
       });
       console.log(`⏱️ Claude response time: ${Date.now() - claudeStart}ms`);
 
-      // Don't assume the reply is content[0] - Claude sometimes puts a
-      // "thinking" block first. Find the actual text block instead.
-      const textBlock = Array.isArray(response.data.content)
-        ? response.data.content.find(block => block && block.type === 'text' && typeof block.text === 'string')
-        : null;
-      if (!textBlock) {
-        const blockTypes = Array.isArray(response.data.content)
-          ? response.data.content.map(b => b && b.type).join(', ')
-          : typeof response.data.content;
-        throw new Error(`No text block found in Claude response (block types: [${blockTypes}])`);
-      }
-      let raw = textBlock.text.trim();
-      raw = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+      const content = Array.isArray(response.data.content) ? response.data.content : [];
+
+      // v34: primary path - tool_choice forces a tool_use block, and
+      // Anthropic hands back input already parsed as a JS object, so there
+      // is no JSON.parse step left to fail here at all.
+      const toolUseBlock = content.find(block => block && block.type === 'tool_use' && block.input && typeof block.input === 'object');
 
       let parsed;
-      try {
-        parsed = JSON.parse(raw);
-      } catch (parseError) {
-        // Claude didn't return clean JSON this turn - fall back to using
-        // whatever text it did produce as the spoken reply, and skip
-        // extraction just for this turn rather than failing the call.
-        console.error('JSON parse failed, using raw text as reply:', parseError.message);
-        const fallbackReply = sanitizeForSpeech(raw);
-        this.conversationHistory.push({ role: 'user', content: userMessage });
-        this.conversationHistory.push({ role: 'assistant', content: fallbackReply });
-        return fallbackReply || "I'm sorry, could you say that one more time for me?";
+      if (toolUseBlock) {
+        parsed = toolUseBlock.input;
+      } else {
+        // Defensive fallback only - should be rare with tool_choice forced.
+        // Reuses the pre-v34 text-block JSON path so a one-off oddity still
+        // degrades gracefully instead of losing the turn.
+        const textBlock = content.find(block => block && block.type === 'text' && typeof block.text === 'string');
+        if (!textBlock) {
+          const blockTypes = content.map(b => b && b.type).join(', ') || '(none)';
+          throw new Error(`No tool_use or text block found in Claude response (block types: [${blockTypes}])`);
+        }
+        let raw = textBlock.text.trim();
+        raw = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+        try {
+          parsed = JSON.parse(raw);
+        } catch (parseError) {
+          console.error('JSON parse failed (fallback text path), using raw text as reply:', parseError.message);
+          const fallbackReply = sanitizeForSpeech(raw);
+          this.conversationHistory.push({ role: 'user', content: userMessage });
+          this.conversationHistory.push({ role: 'assistant', content: fallbackReply });
+          return fallbackReply || "I'm sorry, could you say that one more time for me?";
+        }
       }
 
       const reply = sanitizeForSpeech(parsed.reply || '');
@@ -1372,7 +1471,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '33.0.0',
+    version: '34.0.0',
     timestamp: new Date().toISOString()
   });
 });
