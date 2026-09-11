@@ -367,6 +367,42 @@
  *  - No other logic touched: ready_to_route path, JSON output shape,
  *    address/name rules, title/services logic, routing, SMS, Supabase,
  *    ElevenLabs settings, and Twilio Gather settings all unchanged.
+ *
+ * v33 CHANGES (real test-call transcript: name capture, diagnosed from an
+ * actual call, not another prompt guess):
+ *  - Diagnosis from the transcript: (1) caller said "Joseph, and my last
+ *    name is Sari" in ONE turn, but Amy asked for the last name again the
+ *    very next turn - a parsing miss, not a hearing problem. (2) The
+ *    caller's spelled-out letters ("s a a d e") came back from Twilio's
+ *    speech-to-text as fragments ("I say a d e"), and Amy's read-back of
+ *    the accumulated letters ("b b s a a d") contained letters that were
+ *    never said at all - real evidence of both ASR noise on bare letters
+ *    (b/d/e/p/t/v/z genuinely sound alike over a phone line) and the model
+ *    guess-filling gaps instead of asking again.
+ *  - COMMUNICATION STYLE, prompt-only fixes:
+ *    - New "Combined name capture" rule: if both first and last name are
+ *      given in the same reply, capture both immediately - do not ask
+ *      again for a piece already given in that same breath.
+ *    - Spelling now asks for clarifying words instead of bare letters
+ *      ("S as in Sam, A as in Apple") - bare letters are the likely root
+ *      cause of the misheard spelling in this transcript.
+ *    - New "Never invent a letter" rule: read back only letters actually
+ *      heard; if the spelling is fragmented/unclear, ask the caller to
+ *      spell the whole name again rather than guessing the gap.
+ *    - Name lock rule kept, now triggers on either a spelled OR a plainly
+ *      confirmed name, not spelling only.
+ *  - Code: added GATHER_SPEECH_HINTS (service/company vocabulary plus the
+ *    NATO-style clarifying words used by the new spelling rule) and wired
+ *    it into both <Gather> calls as a new `hints` field. This does NOT
+ *    touch numDigits/timeout/speechTimeout/input - purely additive - but
+ *    flagging it clearly since it's the same TwiML object Joseph said not
+ *    to change: `hints` biases Twilio's own speech recognition toward
+ *    these words, which should reduce exactly the kind of ASR garbling
+ *    seen in this transcript, especially now that Amy will be asking
+ *    callers to use those clarifying words.
+ *  - No changes to JSON output shape, address rules, title/services logic,
+ *    routing, SMS, Supabase, ElevenLabs settings, or the four protected
+ *    Gather settings.
  */
 
 const twilio = require('twilio');
@@ -430,6 +466,32 @@ const AURORA_CONFIG = {
   }
 };
 
+// v33: speech-recognition hint phrases for Twilio's <Gather>. This does NOT
+// change any of the four settings Joseph asked never to touch (numDigits,
+// timeout, speechTimeout, input) - it's a new, additive field on the same
+// object that biases Twilio's speech-to-text toward words it's likely to
+// hear on this line: the company name, the 10 service categories and
+// common related terms, and the NATO/telephone spelling-alphabet words
+// used by the new "spell with clarifying words" name rule above (S as in
+// Sam, etc.) - added because a real test call showed bare letters (b, d,
+// e...) getting misheard, and the alphabet words themselves need to be
+// recognized reliably for that fix to actually work.
+const GATHER_SPEECH_HINTS = [
+  'Warm Home', 'Amy',
+  'roofing', 'roof', 'leak', 'shingles', 'tarping', 'tarp', 'emergency',
+  'tree removal', 'tree', 'stump grinding', 'exterior', 'siding', 'fascia',
+  'gutters', 'painting', 'interior', 'drywall', 'flooring', 'water damage',
+  'mold', 'waterproofing', 'basement', 'crawlspace', 'armor plating',
+  'polyurea', 'new build', 'construction', 'addition', 'millwork',
+  'cabinets', 'solar', 'panels', 'storm damage', 'inspection', 'estimate',
+  'insurance', 'deductible',
+  'Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot', 'Golf', 'Hotel',
+  'India', 'Juliet', 'Kilo', 'Lima', 'Mike', 'November', 'Oscar', 'Papa',
+  'Quebec', 'Romeo', 'Sierra', 'Tango', 'Uniform', 'Victor', 'Whiskey',
+  'Xray', 'Yankee', 'Zulu',
+  'Sam', 'Apple', 'David', 'Edward'
+].join(', ');
+
 // ============================================
 // AURORA SYSTEM PROMPT
 // ============================================
@@ -464,8 +526,11 @@ YOUR COMMUNICATION STYLE:
   1. If the caller states or implies a professional/formal title for themselves (Doctor, Captain, Professor, Reverend, Engineer, etc.), use THAT title with their last name (e.g. "Doctor Chen") - that always takes priority.
   2. Otherwise, use "Mr." for a caller who sounds or presents as male, "Ms." for a caller who sounds or presents as female, paired with their last name (e.g. "Mr. Sadi", "Ms. Rivera"). Make your best natural judgment from the conversation - if it's ever unclear, "sir" or "ma'am" is a safe fallback.
   Use a title in EVERY reply once you have one available, not just occasionally.
-- Name accuracy: Names (especially last names) are easy to mishear on a phone line. If you're not confident you caught a name correctly, or a caller has already repeated it once, politely ask them to spell it out letter by letter rather than just asking them to repeat it again the same way.
-- Name lock (MUST, updated per latest QA): when a caller spells a name letter by letter, confirm it back ONCE - "Alright - Saade, S-A-A-D-E." - then LOCK that exact spelling for the rest of the call, in what you say out loud AND in the extracted.name field. Never substitute a near-homophone (for a name spelled S-A-A-D-E: never Saeed, Saadi, Saudi, State, or any other near-sound-alike). In later turns, say only the locked name - if you're ever unsure you're saying it right, ask "Did I say [locked name] right?" rather than quietly inventing a new version.
+- Name accuracy: Names (especially last names) are easy to mishear on a phone line. If you're not confident you caught a name correctly, or a caller has already repeated it once, politely ask them to spell it out rather than just asking them to repeat it again the same way.
+- Combined name capture (MUST): if a caller gives you BOTH first and last name in the same reply (for example, "It's Joseph, and my last name is Saade"), capture both right then - do NOT ask for the last name again just because you already have the first. Before asking for any piece of their name, re-read what they just said - a real test call caught Amy asking "Can I get your last name as well?" one turn after the caller had already given it in that same breath.
+- Spelling: use words, not bare letters (MUST). Bare letters (b, d, e, p, t, v, z, etc.) sound alike over a phone line and are a common cause of a correctly-spelled name still coming out wrong. When you need a name spelled, ask for it with a clarifying-word format: "Can you spell that for me - like S as in Sam, A as in Apple?" When you read a spelling back, use the same style: "S as in Sam, A as in Apple, A as in Apple, D as in David, E as in Edward - is that right?" (match whichever clarifying words the caller used, if they used their own).
+- Never invent a letter (MUST): when reading back a spelled name, use ONLY the letters you actually heard the caller say this call. If the spelling came through fragmented or unclear and you're not sure it adds up, do NOT guess-fill the gap or invent letters to complete it - say plainly "I want to get this exactly right - can you spell the whole name again for me, one clear letter at a time?" and let them redo it, rather than reading back a guess.
+- Name lock (MUST): once a name (first and/or last) has been correctly confirmed - by spelling or by a clear "yes, that's right" - LOCK it for the rest of the call, in what you say out loud AND in the extracted.name field. Never substitute a near-homophone once locked. In later turns, say only the locked name - if you're ever unsure you're saying it right, ask "Did I say [locked name] right?" rather than quietly inventing a new version.
 - Allowed soft openers: Okay. Alright. Got it. Sure. Makes sense. I hear you. Yeah. Still with you. Hey there. Well. So. Sounds like. That's a lot to deal with. That's great to hear. See CRITICAL - ACKNOWLEDGMENTS below for how to mix these naturally.
 - Forbidden spoken habits: stiff phrases like "Certainly," "How may I assist you today," long compliments on small talk, emoji/markdown/symbols (already covered below), emotional stage tags like bracket-sighs or bracket-laughs - never write those; everything is plain speech only.
 
@@ -1202,7 +1267,8 @@ exports.handleCall = async (req, res) => {
       timeout: 30,
       speechTimeout: 'auto',
       input: 'speech',
-      action: '/voice/gather-response'
+      action: '/voice/gather-response',
+      hints: GATHER_SPEECH_HINTS // v33: additive only, the four settings above are untouched
     });
 
     await speak(gather, agent, greeting, req);
@@ -1262,7 +1328,8 @@ exports.handleGatherResponse = async (req, res) => {
         timeout: 30,
         speechTimeout: 'auto',
         input: 'speech',
-        action: '/voice/gather-response'
+        action: '/voice/gather-response',
+        hints: GATHER_SPEECH_HINTS // v33: additive only, the four settings above are untouched
       });
       await speak(gather, agent, result.response, req);
 
@@ -1305,7 +1372,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '32.0.0',
+    version: '33.0.0',
     timestamp: new Date().toISOString()
   });
 });
