@@ -248,6 +248,29 @@
  *    model, no audio/emotion tags, no change to the JSON output shape,
  *    address-rule core logic, title/services logic, routing, SMS,
  *    Supabase, or Twilio Gather settings.
+ *
+ * v29 CHANGES (prosody - voice melody, not SSML):
+ *  - New CRITICAL - WRITE FOR THE EAR block: short sentences (periods reset
+ *    pitch), empathy/comfort beat and the question kept in SEPARATE
+ *    sentences instead of comma/and-joined so the voice's pitch can reset
+ *    between them, "Alright."/"Okay." allowed to stand as their own short
+ *    beat, and an explicit reminder that the SERIOUS IMPACT FIRST REPLY
+ *    line is always said as three separate short sentences, never merged.
+ *    This is plain-text sentence shaping only - no SSML tags, no markup of
+ *    any kind, still fully compatible with CRITICAL - THIS IS A LIVE PHONE
+ *    CALL's "no symbols, plain spoken sentences" rule above it.
+ *  - ElevenLabs voice settings (gentle expressiveness, isolated change this
+ *    time - NOT stacked with a bigger speed cut the way v6's failed attempt
+ *    was): stability 0.5 -> 0.38 for more natural pitch variation,
+ *    speed 0.97 -> 0.95 (small nudge only), similarityBoost unchanged at
+ *    0.75. modelId unchanged (eleven_turbo_v2_5) - still no v3, still no
+ *    emotional audio tags in production. If this reproduces v6's
+ *    slurred/sleepy failure mode, revert stability toward 0.5 first before
+ *    touching speed again.
+ *  - No other prompt logic touched: comfort-phrase pool, opening sequence,
+ *    serious-impact path, address rules, wrap-up, cost/payment, JSON
+ *    output shape, and all code/routing/SMS/Supabase/Twilio Gather
+ *    behavior are unchanged.
  */
 
 const twilio = require('twilio');
@@ -271,11 +294,15 @@ const AURORA_CONFIG = {
       voiceId: 'OYTbf65OHHFELVut7v2H', // v20: Joseph's chosen voice from ElevenLabs' Voice Library
       modelId: 'eleven_turbo_v2_5',
       // v6 tried stability 0.35 + speed 0.92 together to fix "too fast/flat" -
-      // that combo made her sound slurred and sleepy instead. Reverting
-      // stability to the reliable original value and only barely touching speed.
-      stability: 0.5,
+      // that combo made her sound slurred and sleepy instead. Reverted then.
+      // v29: trying stability alone this time (speed only barely touched, not
+      // stacked with a bigger speed cut like v6 did) for more natural pitch
+      // variation ("prosody") instead of a flat read. Watch for the same
+      // slurred/sleepy failure mode v6 hit - if it recurs, revert stability
+      // toward 0.5 first before touching speed again.
+      stability: 0.38,
       similarityBoost: 0.75,
-      speed: 0.97,
+      speed: 0.95,
       // v12: v10's 6000ms wasn't the fix - ElevenLabs is still failing,
       // it's just hanging until the timeout instead of failing fast. So
       // there's no upside to waiting 6 full seconds every turn - cut it
@@ -427,6 +454,13 @@ CRITICAL - THIS IS A LIVE PHONE CALL, NOT A CHAT WINDOW:
 - Keep every reply SHORT: 1-3 sentences per turn. Ask one question at a time. Real phone agents don't give long speeches - they have a brief, natural back-and-forth.
 - Be warm but efficient - skip long compliments or gushing reactions to small talk. A brief, genuine acknowledgment is enough, then move the conversation forward.
 - Prefer the turn shape: short ack, short reflect, one question. Do not give speeches.
+
+CRITICAL - WRITE FOR THE EAR (voice melody / prosody):
+- Write in short sentences. Each period is a breath - the voice resets its pitch at a period, so a long run-on sentence reads flatter than several short ones.
+- Put the empathy/comfort beat and the question in SEPARATE sentences, not joined with a comma or "and" - splitting them lets the voice's pitch reset between the two, instead of reading them as one flat run.
+- End real questions with a question mark. Let a plain acknowledgment like "Alright." or "Okay." stand as its own short sentence/beat before the next line, rather than folding it into the following sentence.
+- Never pack 3 comfort ideas into one run-on sentence (this reinforces CRITICAL - COMFORT PHRASES above - one beat per turn, and that one beat should be its own short sentence, not stitched onto everything else).
+- The CRITICAL - SERIOUS IMPACT FIRST REPLY line below is written as three short sentences on purpose ("I hope nobody got hurt. Is everyone okay? Is there anything I can do to help?") - always say it exactly as three separate sentences, never merged into one longer sentence.
 
 CRITICAL - ADDRESS RULE: Before asking any address-related question, re-read the ENTIRE conversation so far. If the caller has already told you the street, the city, the state, or the zip code - even just once, even several turns ago - NEVER ask for that piece again. Only ask for the SPECIFIC piece you're still missing (for example, if you have the street but not the city, ask only "What city and state is that in?" - do not re-ask for the whole address). If the caller has given you the complete address already, do not ask about it again at all - move on.
 
@@ -1140,7 +1174,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '28.0.0',
+    version: '29.0.0',
     timestamp: new Date().toISOString()
   });
 });
