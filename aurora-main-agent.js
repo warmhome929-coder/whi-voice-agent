@@ -453,6 +453,57 @@
  *  - No changes to address/name prompt rules, title/services logic,
  *    routing, SMS, Supabase, ElevenLabs settings, or Twilio Gather
  *    settings.
+ *
+ * v35 CHANGES (phone confirm + hang-up pacing, from Joseph's QA-bot spec):
+ *  - New CRITICAL - PHONE CONFIRM prompt rule: read the phone number back
+ *    once in grouped digits, wait for yes/no, THEN move to the next field.
+ *    Once confirmed it's locked like a name/address field - if the caller
+ *    asks for it back later (even right after wrap-up), answer with the
+ *    locked number instead of leaving it in silence.
+ *  - New CRITICAL - HANG-UP PACING prompt block spelling out the 5-step
+ *    pacing Joseph specified: finish wrap-up first, close only when really
+ *    done, leave a short listen window before the line actually ends,
+ *    answer one last question if the caller speaks in that window, never
+ *    stack wrap+goodbye+hangup with zero pause.
+ *  - Code: both hangup branches in handleGatherResponse (ready_to_route and
+ *    the v30 isCallerClosing early-goodbye path) now open a short (~2s)
+ *    <Gather> pointed at a new /voice/post-goodbye route instead of hanging
+ *    up immediately - if the caller says something in that window, Twilio
+ *    POSTs there; if they're silent, the Gather times out and falls
+ *    through to the Hangup already in the same TwiML document, same
+ *    pattern the silence-timeout fallback has always used (no extra HTTP
+ *    round-trip for the silent case).
+ *  - New exports.handlePostGoodbye: answers the one follow-up question
+ *    (if any) using the SAME in-memory session (so locked name/phone/
+ *    address are available), says a final goodbye, and hangs up for real -
+ *    bounded to exactly one more exchange, not full re-opened intake.
+ *  - IMPORTANT implementation detail caught by self-testing, not shipped
+ *    naively: handlePostGoodbye calls agent.converseAndExtract() directly,
+ *    NOT agent.handleConversation(). hasRequiredData() is still true after
+ *    a completed case, so calling handleConversation() again would have
+ *    silently re-run buildWrapUpLine()/saveInquiryData()/
+ *    sendSMSConfirmation() a SECOND time - a duplicate Supabase row and a
+ *    duplicate confirmation text to the caller. Caught this via an HTTP-
+ *    level test (mocked Claude+Supabase, real Express server, two real
+ *    requests in sequence against the same CallSid) before fixing it -
+ *    confirmed via the same test that exactly one Supabase save now
+ *    happens across both turns.
+ *  - Stopped calling endCallSession() immediately in both hangup branches
+ *    (was v30-v34 behavior) - doing so would wipe the session's locked
+ *    data before a caller who speaks in the listen window could get an
+ *    answer. /voice/status already cleans up sessions reliably once a call
+ *    actually ends, the same safety net the plain-silence-timeout path has
+ *    always relied on instead of calling it directly.
+ *  - Self-tested via a real local Express server (not just mocked function
+ *    calls): full happy path (info given -> ready_to_route -> listen
+ *    window opens -> caller asks "what number do you have?" -> answered
+ *    correctly with the locked number -> real hangup, exactly one Supabase
+ *    save total) and the silent-post-goodbye case (plain goodbye, no
+ *    crash). Not yet tested against a live Twilio call.
+ *  - No changes to JSON output shape, address/name lock rules, title/
+ *    services logic, routing, SMS/Supabase field shape, ElevenLabs
+ *    settings, or the four protected Gather settings (numDigits, timeout,
+ *    speechTimeout, input) on the main mid-call Gather.
  */
 
 const twilio = require('twilio');
@@ -680,6 +731,11 @@ CRITICAL - NEVER LEAVE THE CALLER IN SILENCE:
 - Prefer 1-3 short sentences. Long replies make the next gap feel worse.
 - Do not leave the caller with nothing while you "prepare" a long speech.
 
+CRITICAL - PHONE CONFIRM (MUST):
+- When the caller gives you a phone number, do NOT just say "Got it" and move on. Read it back ONCE in clear grouped digits, then wait for a yes or no: "Alright - nine two nine, two four five, four nine one eight. Is that right?"
+- Only after they confirm it, move on to the next missing field (usually address).
+- Once confirmed, that phone number is LOCKED for the rest of the call, same as a locked name or address - if the caller asks "what number do you have?" later, including right after wrap-up, answer with the locked number. Never leave that hanging in silence.
+
 CRITICAL - ADDRESS CAPTURE AND CONFIRM:
 - Prefer collecting street first, then city/state/zip. Re-read the whole conversation before asking - never re-ask a piece already given (see CRITICAL - NO RE-ASK above).
 - Street name fidelity (MUST): do NOT silently "correct" an uncommon street name into a more common-sounding one (for example, "Sylvan" must never become "Sullivan"). When a street name sounds uncommon or you're not fully sure you heard it right, spell it back or confirm it: "Sylvan - S-Y-L-V-A-N - is that right?"
@@ -697,7 +753,14 @@ CRITICAL - WRAP-UP LANGUAGE:
 - service description examples: "roofing leak", "emergency roofing case" - NEVER invent words like "roofing week".
 - Do not change city/street/number in the wrap-up from what was confirmed.
 - Once the caller is clearly done - thanks / that's all / goodbye / nothing else - OR intake is complete and they've confirmed it, give one short, clean close, for example: "Thank you for calling Warm Home. Goodbye." Do not add another question, another comfort phrase, or drag the goodbye out.
-- After you've said that closing line, the conversation is OVER - do not leave it open waiting for the caller to say anything else. The call ends right there (this is enforced in code as well - see the v30/v32 hangup logic).
+- After you've said that closing line, the conversation is done - do not keep talking or ask anything further. The call closes out shortly after (this is paced and enforced in code - see CRITICAL - HANG-UP PACING below and the v30/v32/v35 hangup logic): there's a brief listen window in case the caller has one last quick thing to say (like asking to confirm the phone number), then it ends.
+
+CRITICAL - HANG-UP PACING (MUST):
+1. Finish the wrap-up/confirmation first - never cut that short.
+2. Only ask "anything else?" if it's genuinely needed; if the caller says thanks/that's all, go straight to the close: "Thank you for calling Warm Home. Goodbye."
+3. After that closing line, the code leaves a short listen window (about 1-2 seconds) before the call actually ends, in case the caller is still talking.
+4. If the caller says something in that window (for example, "what number do you have?"), answer it - using the locked details you already have, per CRITICAL - PHONE CONFIRM and the address/name lock rules - then say goodbye again and let the call end. Do not leave that final question in silence.
+5. Never treat the goodbye line as instant silence-and-hangup with nothing after it - the caller may still be mid-sentence.
 
 CRITICAL - COST AND PAYMENT QUESTIONS:
 - If the caller asks about pricing, cost, who pays, or how they pay:
@@ -1409,8 +1472,28 @@ exports.handleGatherResponse = async (req, res) => {
       // Say the closing line and the goodbye together as ONE utterance so
       // there's no jarring switch to a different voice at the very end.
       await speak(twiml, agent, `${result.response} Thank you for calling. Goodbye!`, req);
+      // v35: HANG-UP PACING - leave a short listen window (~2s) before the
+      // call actually ends, in case the caller is still talking (e.g.
+      // "what number do you have?"). If they speak, Twilio POSTs to
+      // /voice/post-goodbye, which answers using the locked call data and
+      // closes out for good. If they stay silent, this gather times out
+      // and falls through to the hangup right below it - no second HTTP
+      // round-trip needed for the silent case. Deliberately NOT calling
+      // endCallSession() here anymore (was v30-v34 behavior) - ending the
+      // session immediately would wipe the locked name/phone/address
+      // before a caller who speaks in the listen window could get an
+      // answer. /voice/status already cleans up the session reliably once
+      // the call actually ends, same as the plain-silence-timeout path
+      // below always relied on.
+      twiml.gather({
+        numDigits: 0,
+        timeout: 2,
+        speechTimeout: 'auto',
+        input: 'speech',
+        action: '/voice/post-goodbye',
+        hints: GATHER_SPEECH_HINTS
+      });
       twiml.hangup();
-      endCallSession(callSid);
     } else if (AuroraAgent.isCallerClosing(userMessage) && !/\?\s*$/.test((result.response || '').trim())) {
       // v30: caller said goodbye but the case wasn't fully collected/
       // submitted - still end the call cleanly instead of leaving it open
@@ -1419,8 +1502,18 @@ exports.handleGatherResponse = async (req, res) => {
       // just speak it and hang up - no second "Thank you for calling"
       // stacked on top, and no save/SMS since the case isn't complete.
       await speak(twiml, agent, result.response, req);
+      // v35: same short listen window before ending, and same reasoning
+      // for not calling endCallSession() here directly - see the
+      // ready_to_route branch above.
+      twiml.gather({
+        numDigits: 0,
+        timeout: 2,
+        speechTimeout: 'auto',
+        input: 'speech',
+        action: '/voice/post-goodbye',
+        hints: GATHER_SPEECH_HINTS
+      });
       twiml.hangup();
-      endCallSession(callSid);
     } else {
       const gather = twiml.gather({
         numDigits: 0,
@@ -1453,6 +1546,47 @@ exports.handleGatherResponse = async (req, res) => {
   }
 };
 
+// v35: HANG-UP PACING - handles the short listen window left open after a
+// closing goodbye (see the two hangup branches in handleGatherResponse
+// above). Twilio only POSTs here if the caller actually said something in
+// that ~2s window - if they stayed silent, that Gather times out and the
+// call already ended via the hangup in the same TwiML document, no HTTP
+// round-trip needed. This route is deliberately bounded to ONE more
+// exchange (answer, then a final goodbye, then hang up for real) rather
+// than reopening full back-and-forth intake, so it can't loop.
+exports.handlePostGoodbye = async (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  const userMessage = req.body.SpeechResult || '';
+  const callSid = req.body.CallSid;
+  const agent = getOrCreateAgent(callSid, req.body.To);
+
+  try {
+    if (userMessage && userMessage.trim()) {
+      // Deliberately calls converseAndExtract() directly, NOT
+      // handleConversation() - the case may already be finalized
+      // (ready_to_route already ran buildWrapUpLine/saveInquiryData/
+      // sendSMSConfirmation once), and hasRequiredData() would still be
+      // true here, so handleConversation() would finalize AGAIN and
+      // double-save/double-text the caller. converseAndExtract() just
+      // gets Claude's answer for this one follow-up turn, using the same
+      // locked name/phone/address data and voice-call rules (e.g.
+      // CRITICAL - PHONE CONFIRM), without re-running the finalize path.
+      const reply = await agent.converseAndExtract(userMessage);
+      await speak(twiml, agent, `${reply} Thank you for calling. Goodbye!`, req);
+    } else {
+      await speak(twiml, agent, "Thank you for calling Warm Home. Goodbye.", req);
+    }
+  } catch (error) {
+    console.error('❌ Post-goodbye handling error:', error);
+    await speak(twiml, agent, "Thank you for calling Warm Home. Goodbye.", req);
+  }
+
+  twiml.hangup();
+  endCallSession(callSid);
+  res.type('text/xml');
+  res.send(twiml.toString());
+};
+
 exports.handleCallStatus = async (req, res) => {
   const callSid = req.body.CallSid;
   if (callSid) endCallSession(callSid);
@@ -1471,7 +1605,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '34.0.0',
+    version: '35.0.0',
     timestamp: new Date().toISOString()
   });
 });
@@ -1488,6 +1622,7 @@ app.get('/audio/:id.mp3', (req, res) => {
 
 app.post('/voice', exports.handleCall);
 app.post('/voice/gather-response', exports.handleGatherResponse);
+app.post('/voice/post-goodbye', exports.handlePostGoodbye); // v35: HANG-UP PACING listen window
 app.post('/voice/status', exports.handleCallStatus);
 
 // v10: log which required keys are actually present at startup - without
