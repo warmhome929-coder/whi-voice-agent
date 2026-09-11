@@ -271,6 +271,36 @@
  *    serious-impact path, address rules, wrap-up, cost/payment, JSON
  *    output shape, and all code/routing/SMS/Supabase/Twilio Gather
  *    behavior are unchanged.
+ *
+ * v30 CHANGES (real bug: call doesn't hang up):
+ *  - Root cause: the only existing hangup path was status ===
+ *    'ready_to_route', which requires hasRequiredData() to be true (the
+ *    FULL case collected). If the caller said goodbye before the case was
+ *    fully collected (no address given, didn't want a callback, etc.),
+ *    hasRequiredData() never went true, so handleGatherResponse always
+ *    fell into the "else" branch and opened ANOTHER <Gather> - the call
+ *    just sat open until the 30-second silence timeout finally triggered
+ *    the disconnect fallback and hung up. That's the "she doesn't hang up"
+ *    behavior from the test call.
+ *  - Fix: new static AuroraAgent.isCallerClosing(userMessage) - a plain
+ *    keyword heuristic (same style/spirit as holdsSubmission above) that
+ *    matches goodbye/closing phrases (bye, goodbye, that's all, that's it,
+ *    nothing else, no thank you, I'm good, all set, etc.). In
+ *    handleGatherResponse, when status isn't 'ready_to_route' but the
+ *    caller's message matches this AND Claude's own reply for that turn
+ *    isn't itself a question (so a real wrap-up question is never cut
+ *    off), Amy speaks her reply (already the short closing line per
+ *    CRITICAL - WRAP-UP LANGUAGE) and the call hangs up right then,
+ *    instead of opening another Gather and waiting out the timeout. No
+ *    save/SMS/Supabase call happens on this path since the case is
+ *    incomplete - that behavior is intentionally unchanged.
+ *  - Self-tested the new isCallerClosing() against 16 sample phrases
+ *    (closings and non-closings, including cost questions and address
+ *    statements) before shipping - all passed.
+ *  - No changes to the ready_to_route path, JSON output shape, address-
+ *    rule logic, title/services logic, routing, SMS, Supabase payload, or
+ *    Twilio Gather settings - this only adds a second, narrower hangup
+ *    trigger alongside the existing one.
  */
 
 const twilio = require('twilio');
@@ -933,6 +963,23 @@ class AuroraAgent {
     return askedToWait || askingAboutCost;
   }
 
+  // v30: code-level backstop for "the call doesn't hang up" - the only
+  // existing hangup path was status === 'ready_to_route', which requires
+  // hasRequiredData() to be true (full case collected AND saved). A real
+  // test call showed a caller saying goodbye/that's all before the case
+  // was fully collected (e.g. no address given, or they didn't want a
+  // callback) - hasRequiredData() never went true, so the call just sat
+  // open on another <Gather>, waiting out the full 30s silence timeout
+  // before the fallback line finally hung up. This is a plain keyword
+  // heuristic, same style as holdsSubmission above - it only fires when
+  // Claude's own reply this turn isn't itself a question, so a real
+  // wrap-up question never gets cut off.
+  static isCallerClosing(userMessage) {
+    if (!userMessage) return false;
+    const text = userMessage.toLowerCase().trim();
+    return /\b(bye|goodbye|good bye|that'?s all|that'?s it|that'?s everything|nothing else|no,? ?that'?s it|no thank you|no thanks|i'?m good|all set|that'?ll be (all|it))\b/.test(text);
+  }
+
   async determineRouting() {
     const urgency = this.collectedData.urgencyLevel;
     const service = this.collectedData.serviceType;
@@ -1125,6 +1172,16 @@ exports.handleGatherResponse = async (req, res) => {
       await speak(twiml, agent, `${result.response} Thank you for calling. Goodbye!`, req);
       twiml.hangup();
       endCallSession(callSid);
+    } else if (AuroraAgent.isCallerClosing(userMessage) && !/\?\s*$/.test((result.response || '').trim())) {
+      // v30: caller said goodbye but the case wasn't fully collected/
+      // submitted - still end the call cleanly instead of leaving it open
+      // on another Gather. Claude's own reply this turn is already the
+      // short closing line per the CRITICAL - WRAP-UP LANGUAGE rule, so we
+      // just speak it and hang up - no second "Thank you for calling"
+      // stacked on top, and no save/SMS since the case isn't complete.
+      await speak(twiml, agent, result.response, req);
+      twiml.hangup();
+      endCallSession(callSid);
     } else {
       const gather = twiml.gather({
         numDigits: 0,
@@ -1174,7 +1231,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '29.0.0',
+    version: '30.0.0',
     timestamp: new Date().toISOString()
   });
 });
