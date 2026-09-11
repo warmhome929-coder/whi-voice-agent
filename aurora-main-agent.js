@@ -504,6 +504,52 @@
  *    services logic, routing, SMS/Supabase field shape, ElevenLabs
  *    settings, or the four protected Gather settings (numDigits, timeout,
  *    speechTimeout, input) on the main mid-call Gather.
+ *
+ * v36 CHANGES (name/address fidelity + reflect-the-job + correction-safe
+ * hangup, from Joseph's latest voice QA on a real ~3min call):
+ *  - Name lock (MUST) bullet: added explicit forbidden-homophone examples
+ *    for the Saade case (never Seed/Saeed/Saadi/Saudi/Sadi/Sayed) - same
+ *    lock mechanism as before, just spelling out what "never substitute a
+ *    near-homophone" actually rules out.
+ *  - Street name fidelity (MUST) bullet: added a second worked example
+ *    (Saddle Brook must never become Battle Brook) alongside the existing
+ *    Sylvan/Sullivan one - same rule, one more example.
+ *  - New Correction handling (MUST) bullet under CRITICAL - ADDRESS
+ *    CAPTURE AND CONFIRM: when the caller corrects any field, fix ONLY
+ *    that field, re-read it back, lock it (existing LOCK RULE), then
+ *    continue - and explicitly, do not say the closing goodbye while a
+ *    correction is still being confirmed/locked.
+ *  - New CRITICAL - UNDERSTAND AND REFLECT THE JOB block (before WRAP-UP
+ *    LANGUAGE): reflect the service/issue, leak status, and urgency
+ *    before wrapping up; if leak status is relevant and unknown, ask ONE
+ *    leak question and WAIT for the answer rather than assuming "not
+ *    leaking"/"nothing urgent"; never wrap up over an unanswered question.
+ *  - CRITICAL - HANG-UP PACING: added a new point 1 - never say goodbye
+ *    while the caller is still correcting name/phone/address or a
+ *    correction hasn't been re-locked yet - and reinforced the existing
+ *    "no dead air, no second follow-up gather after the post-goodbye
+ *    exchange" behavior in words (the code already only allows exactly
+ *    one post-goodbye exchange - see v35's handlePostGoodbye).
+ *  - Code: new AuroraAgent.looksLikeCorrection(userMessage) static
+ *    heuristic (same plain-keyword style as holdsSubmission/
+ *    isCallerClosing) and wired it into the v30 early-goodbye branch in
+ *    handleGatherResponse as an extra condition. Real gap this closes: a
+ *    caller message like "actually the zip is wrong, thanks" contains the
+ *    closing keyword "thanks", which before v36 could trigger an
+ *    immediate hangup via that branch before the zip correction was ever
+ *    confirmed back to the caller. Now that branch is skipped when the
+ *    message looks like a correction, and falls through to the normal
+ *    open-Gather turn instead, same as any other mid-call exchange - the
+ *    correction gets a normal turn to be heard, confirmed, and locked.
+ *  - Did NOT touch: the ready_to_route (hasRequiredData) hangup path,
+ *    checkHouseNumberMismatch, buildWrapUpLine, the PHONE CONFIRM rule
+ *    (already matched this round's spec exactly), the v35 hang-up-pacing
+ *    listen-window/post-goodbye mechanism itself, acknowledgment variety,
+ *    dead-air bridges, or one-question-per-turn - all already compliant
+ *    with this round's spec and left as-is per "merge, don't replace."
+ *  - No changes to JSON output shape, roles, services list, titles,
+ *    NEVER/ALWAYS lists, routing, SMS/Supabase logic, or the four
+ *    protected Gather settings on the main mid-call Gather.
  */
 
 const twilio = require('twilio');
@@ -631,7 +677,7 @@ YOUR COMMUNICATION STYLE:
 - Combined name capture (MUST): if a caller gives you BOTH first and last name in the same reply (for example, "It's Joseph, and my last name is Saade"), capture both right then - do NOT ask for the last name again just because you already have the first. Before asking for any piece of their name, re-read what they just said - a real test call caught Amy asking "Can I get your last name as well?" one turn after the caller had already given it in that same breath.
 - Spelling: use words, not bare letters (MUST). Bare letters (b, d, e, p, t, v, z, etc.) sound alike over a phone line and are a common cause of a correctly-spelled name still coming out wrong. When you need a name spelled, ask for it with a clarifying-word format: "Can you spell that for me - like S as in Sam, A as in Apple?" When you read a spelling back, use the same style: "S as in Sam, A as in Apple, A as in Apple, D as in David, E as in Edward - is that right?" (match whichever clarifying words the caller used, if they used their own).
 - Never invent a letter (MUST): when reading back a spelled name, use ONLY the letters you actually heard the caller say this call. If the spelling came through fragmented or unclear and you're not sure it adds up, do NOT guess-fill the gap or invent letters to complete it - say plainly "I want to get this exactly right - can you spell the whole name again for me, one clear letter at a time?" and let them redo it, rather than reading back a guess.
-- Name lock (MUST): once a name (first and/or last) has been correctly confirmed - by spelling or by a clear "yes, that's right" - LOCK it for the rest of the call, in what you say out loud AND in the extracted.name field. Never substitute a near-homophone once locked. In later turns, say only the locked name - if you're ever unsure you're saying it right, ask "Did I say [locked name] right?" rather than quietly inventing a new version.
+- Name lock (MUST): once a name (first and/or last) has been correctly confirmed - by spelling or by a clear "yes, that's right" - LOCK it for the rest of the call, in what you say out loud AND in the extracted.name field. Never substitute a near-homophone once locked - for example, once "S-A-A-D-E" is confirmed as "Saade," it stays "Saade" for the rest of the call; never drift to Seed, Saeed, Saadi, Saudi, Sadi, or Sayed. In later turns, say only the locked name - if you're ever unsure you're saying it right, ask "Did I say [locked name] right?" rather than quietly inventing a new version.
 - Allowed soft openers: Okay. Alright. Got it. Sure. Makes sense. I hear you. Yeah. Still with you. Hey there. Well. So. Sounds like. That's a lot to deal with. That's great to hear. See CRITICAL - ACKNOWLEDGMENTS below for how to mix these naturally.
 - Forbidden spoken habits: stiff phrases like "Certainly," "How may I assist you today," long compliments on small talk, emoji/markdown/symbols (already covered below), emotional stage tags like bracket-sighs or bracket-laughs - never write those; everything is plain speech only.
 
@@ -738,7 +784,8 @@ CRITICAL - PHONE CONFIRM (MUST):
 
 CRITICAL - ADDRESS CAPTURE AND CONFIRM:
 - Prefer collecting street first, then city/state/zip. Re-read the whole conversation before asking - never re-ask a piece already given (see CRITICAL - NO RE-ASK above).
-- Street name fidelity (MUST): do NOT silently "correct" an uncommon street name into a more common-sounding one (for example, "Sylvan" must never become "Sullivan"). When a street name sounds uncommon or you're not fully sure you heard it right, spell it back or confirm it: "Sylvan - S-Y-L-V-A-N - is that right?"
+- Street name fidelity (MUST): do NOT silently "correct" an uncommon street or city name into a more common-sounding one (for example, "Sylvan" must never become "Sullivan," and "Saddle Brook" must never become "Battle Brook"). When a street or city name sounds uncommon or you're not fully sure you heard it right, spell it back or confirm it: "Sylvan - S-Y-L-V-A-N - is that right?"
+- Correction handling (MUST): if the caller corrects any field - name, phone, street, city, state, or zip - fix ONLY that field. Re-read back just that corrected field, lock it in (see LOCK RULE below), then continue from where you left off. Do not re-ask or re-read fields that were already correct. Do not say a closing goodbye while a correction is still being confirmed or locked in - finish locking the corrected field first, THEN move to wrap-up/goodbye if the call is otherwise done.
 - When you have street + city + state + zip, read back the FULL address ONCE as one block before wrapping up.
 - For house number and zip in readbacks, speak digits clearly (four five seven... seven seven six four zero) so they cannot collapse (never turn 457 into 67).
 - If the caller says the readback is wrong: ask ONLY the wrong field. Do not re-ask confirmed pieces or the whole address.
@@ -746,6 +793,11 @@ CRITICAL - ADDRESS CAPTURE AND CONFIRM:
 - If a city or zip might be misheard (e.g. Beaumont vs Belmont), clarify with a choice: "Beaumont or Belmont?"
 - LOCK RULE: once a field is confirmed or corrected (for example, the caller says "Beaumont" and you clarify it as Beaumont, or "77640" for the zip), that value is LOCKED for the rest of the call - never revert to an earlier, wrong value later (do not say "Belmont" again after the caller has confirmed "Beaumont"). Never invent or alter a house number, street name, city, state, or zip on your own - only use what the caller actually said.
 - Wrap-up and any "I've got..." lines MUST use the same address pieces already confirmed - do not paraphrase into a new address.
+
+CRITICAL - UNDERSTAND AND REFLECT THE JOB (MUST - before wrap-up):
+- Before you wrap up, briefly reflect back what the caller actually told you: the service/issue (for example, "old roof that needs replacing," "shingles blew off"), the leak status if it's relevant to the issue and known (leaking / not leaking / unknown), and the urgency (emergency / urgent / routine).
+- If leak status is relevant to the issue and hasn't come up yet, ask ONE direct leak question ("Is it actively leaking right now?") and WAIT for their answer before wrapping up - never invent or assume "not leaking" or "nothing urgent" just to move things along. Only treat it as settled once they've actually told you or clearly agreed.
+- Never leave a leak question (or any question you just asked) unanswered and then proceed to wrap up as if it were settled.
 
 CRITICAL - WRAP-UP LANGUAGE:
 - When summarizing the case, stick to known fields only.
@@ -756,11 +808,12 @@ CRITICAL - WRAP-UP LANGUAGE:
 - After you've said that closing line, the conversation is done - do not keep talking or ask anything further. The call closes out shortly after (this is paced and enforced in code - see CRITICAL - HANG-UP PACING below and the v30/v32/v35 hangup logic): there's a brief listen window in case the caller has one last quick thing to say (like asking to confirm the phone number), then it ends.
 
 CRITICAL - HANG-UP PACING (MUST):
-1. Finish the wrap-up/confirmation first - never cut that short.
-2. Only ask "anything else?" if it's genuinely needed; if the caller says thanks/that's all, go straight to the close: "Thank you for calling Warm Home. Goodbye."
-3. After that closing line, the code leaves a short listen window (about 1-2 seconds) before the call actually ends, in case the caller is still talking.
-4. If the caller says something in that window (for example, "what number do you have?"), answer it - using the locked details you already have, per CRITICAL - PHONE CONFIRM and the address/name lock rules - then say goodbye again and let the call end. Do not leave that final question in silence.
-5. Never treat the goodbye line as instant silence-and-hangup with nothing after it - the caller may still be mid-sentence.
+1. Never say the closing goodbye while the caller is still correcting a name, phone number, or address, or while a correction hasn't been re-confirmed/locked yet (see CRITICAL - ADDRESS CAPTURE AND CONFIRM's Correction handling rule) - lock the correction first, THEN close if the call is otherwise done.
+2. Finish the wrap-up/confirmation first - never cut that short.
+3. Only ask "anything else?" if it's genuinely needed; if the caller says thanks/that's all, go straight to the close: "Thank you for calling Warm Home. Goodbye."
+4. After that closing line, the code leaves a short listen window (about 1-2 seconds) before the call actually ends, in case the caller is still talking.
+5. If the caller says something in that window (for example, "what number do you have?"), answer it - using the locked details you already have, per CRITICAL - PHONE CONFIRM and the address/name lock rules - then say goodbye again and let the call end. Do not leave that final question in silence.
+6. Never treat the goodbye line as instant silence-and-hangup with nothing after it - the caller may still be mid-sentence. Never leave a long dead-air gap after goodbye, and never open a second follow-up gather after that final post-goodbye exchange - it's one exchange, then the call actually ends.
 
 CRITICAL - COST AND PAYMENT QUESTIONS:
 - If the caller asks about pricing, cost, who pays, or how they pay:
@@ -1281,6 +1334,21 @@ class AuroraAgent {
     return /\b(bye|goodbye|good bye|thanks|thank you|that'?s all|that'?s it|that'?s everything|nothing else|no,? ?that'?s it|no thank you|no thanks|i'?m good|all set|that'?ll be (all|it)|we'?re done|i'?m done|that covers it)\b/.test(text);
   }
 
+  // v36: code-level backstop for "don't say goodbye while they're still
+  // correcting something" - a real risk with the isCallerClosing check
+  // above is a message like "actually the zip is wrong, thanks" tripping
+  // the "thanks" closing keyword and ending the call before the
+  // correction ever got confirmed/locked. This is the same plain-keyword
+  // heuristic style as holdsSubmission/isCallerClosing above - it only
+  // needs to catch the common correction phrasings, not every possible
+  // one, since it's a safety net on top of the prompt rule, not the only
+  // line of defense.
+  static looksLikeCorrection(userMessage) {
+    if (!userMessage) return false;
+    const text = userMessage.toLowerCase();
+    return /\b(actually|no,? that'?s (not|wrong)|that'?s (incorrect|wrong)|it'?s not|it'?s actually|wrong (number|address|name|spelling|zip|email|street|city)|i said|correction|let me correct|meant to say|i misspoke)\b/.test(text);
+  }
+
   async determineRouting() {
     const urgency = this.collectedData.urgencyLevel;
     const service = this.collectedData.serviceType;
@@ -1494,13 +1562,19 @@ exports.handleGatherResponse = async (req, res) => {
         hints: GATHER_SPEECH_HINTS
       });
       twiml.hangup();
-    } else if (AuroraAgent.isCallerClosing(userMessage) && !/\?\s*$/.test((result.response || '').trim())) {
+    } else if (AuroraAgent.isCallerClosing(userMessage) && !/\?\s*$/.test((result.response || '').trim()) && !AuroraAgent.looksLikeCorrection(userMessage)) {
       // v30: caller said goodbye but the case wasn't fully collected/
       // submitted - still end the call cleanly instead of leaving it open
       // on another Gather. Claude's own reply this turn is already the
       // short closing line per the CRITICAL - WRAP-UP LANGUAGE rule, so we
       // just speak it and hang up - no second "Thank you for calling"
       // stacked on top, and no save/SMS since the case isn't complete.
+      // v36: also don't take this path if the caller's message looks like
+      // a correction ("actually the zip is wrong, thanks") - a bare
+      // closing keyword like "thanks" showing up alongside a correction
+      // should not end the call before that correction gets confirmed and
+      // locked. Falls through to the normal open-Gather branch below
+      // instead, same as any other mid-conversation turn.
       await speak(twiml, agent, result.response, req);
       // v35: same short listen window before ending, and same reasoning
       // for not calling endCallSession() here directly - see the
@@ -1605,7 +1679,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '35.0.0',
+    version: '36.0.0',
     timestamp: new Date().toISOString()
   });
 });
