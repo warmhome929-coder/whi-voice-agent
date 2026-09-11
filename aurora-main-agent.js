@@ -337,6 +337,36 @@
  *    voice settings (already at stability 0.38/speed 0.95/similarity 0.75/
  *    eleven_turbo_v2_5 from v29), or the v30 hangup fix - all explicitly
  *    on the KEEP list for this round.
+ *
+ * v32 CHANGES (hang up after goodbye - closing the gap in v30's fix):
+ *  - Root cause of the remaining gap: v30's AuroraAgent.isCallerClosing()
+ *    only matched "no thank you"/"no thanks" (required a leading "no"), so
+ *    a caller ending the call with a bare "Thanks" or "Thank you" - very
+ *    common - fell through and the call stayed open on another <Gather>
+ *    until the 30s silence timeout. This round's QA spec explicitly lists
+ *    "thanks" as a closing signal, so it's now in the keyword list, along
+ *    with a few more plain closings ("we're done", "I'm done", "that
+ *    covers it").
+ *  - The ready_to_route (completed-intake) hangup path was checked and is
+ *    already correct - it speaks the closing line and calls twiml.hangup()
+ *    unconditionally, every turn it fires, not just on timeout. No bug
+ *    found there; verified rather than changed.
+ *  - CRITICAL - WRAP-UP LANGUAGE: added the exact suggested close line
+ *    ("Thank you for calling Warm Home. Goodbye.") as an example, and an
+ *    explicit "the conversation is over, don't leave it open" line
+ *    pointing at the code-level hangup.
+ *  - Known trade-off, flagged not hidden: "thanks" alone now matches even
+ *    mid-call (e.g. "Thanks, but what about the cost?") - this is still
+ *    protected from an early hangup by the existing guard that Claude's
+ *    reply for that turn must not end in a question mark, but if Claude
+ *    ever answers a cost question with a flat statement (no follow-up
+ *    question), a caller who says "thanks" while still mid-topic could get
+ *    cut off. Worth watching on the next test call.
+ *  - Self-tested the widened isCallerClosing() against 17 sample phrases
+ *    before shipping - all passed.
+ *  - No other logic touched: ready_to_route path, JSON output shape,
+ *    address/name rules, title/services logic, routing, SMS, Supabase,
+ *    ElevenLabs settings, and Twilio Gather settings all unchanged.
  */
 
 const twilio = require('twilio');
@@ -551,7 +581,8 @@ CRITICAL - WRAP-UP LANGUAGE:
 - Allowed shape: "So to wrap up, [title last name] - I've got your [service description] marked as [urgency] at [street], [city], [state] [zip]. Our team will call you shortly."
 - service description examples: "roofing leak", "emergency roofing case" - NEVER invent words like "roofing week".
 - Do not change city/street/number in the wrap-up from what was confirmed.
-- Once the caller says goodbye (or a clear closing like "that's all", "thank you, bye"), give one short, clean closing line back and then end the call - do not add another question, another comfort phrase, or drag the goodbye out.
+- Once the caller is clearly done - thanks / that's all / goodbye / nothing else - OR intake is complete and they've confirmed it, give one short, clean close, for example: "Thank you for calling Warm Home. Goodbye." Do not add another question, another comfort phrase, or drag the goodbye out.
+- After you've said that closing line, the conversation is OVER - do not leave it open waiting for the caller to say anything else. The call ends right there (this is enforced in code as well - see the v30/v32 hangup logic).
 
 CRITICAL - COST AND PAYMENT QUESTIONS:
 - If the caller asks about pricing, cost, who pays, or how they pay:
@@ -1011,10 +1042,16 @@ class AuroraAgent {
   // heuristic, same style as holdsSubmission above - it only fires when
   // Claude's own reply this turn isn't itself a question, so a real
   // wrap-up question never gets cut off.
+  // v32: widened the phrase list - QA's "hang up after goodbye" spec
+  // explicitly lists "thanks" as a closing signal, and the original list
+  // only caught "no thank you"/"no thanks" (required a leading "no"), so a
+  // bare "Thanks" or "Thank you" at the end of a call fell through and the
+  // call stayed open. Also added a few more plain closing phrases from the
+  // spec ("we're done", "I'm done", "that covers it").
   static isCallerClosing(userMessage) {
     if (!userMessage) return false;
     const text = userMessage.toLowerCase().trim();
-    return /\b(bye|goodbye|good bye|that'?s all|that'?s it|that'?s everything|nothing else|no,? ?that'?s it|no thank you|no thanks|i'?m good|all set|that'?ll be (all|it))\b/.test(text);
+    return /\b(bye|goodbye|good bye|thanks|thank you|that'?s all|that'?s it|that'?s everything|nothing else|no,? ?that'?s it|no thank you|no thanks|i'?m good|all set|that'?ll be (all|it)|we'?re done|i'?m done|that covers it)\b/.test(text);
   }
 
   async determineRouting() {
@@ -1268,7 +1305,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '31.0.0',
+    version: '32.0.0',
     timestamp: new Date().toISOString()
   });
 });
