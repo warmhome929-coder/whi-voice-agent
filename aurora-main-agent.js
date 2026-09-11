@@ -606,6 +606,63 @@
  *  - No changes to JSON output shape, roles, services list, titles,
  *    NEVER/ALWAYS lists, routing, SMS/Supabase logic, ElevenLabs settings,
  *    or the four protected Gather settings on the main mid-call Gather.
+ *
+ * v38 CHANGES (no-dead-turn guard + wrap-confirmation gate - from a
+ * "commander bot" spec calling for real CODE-level fixes, not prompt text,
+ * after two more real calls: (1) ~23s of silence after a phone-confirm
+ * "yes" ending in a false "we got disconnected" hangup mid-intake, never
+ * having asked for the address; (2) a wrap-up that read back a wrong
+ * address, where the caller corrected it three times but Amy talked over
+ * him with goodbye and hung up anyway):
+ *  - IMPORTANT: at the time of call (2), v37's Address Lock FSM (fixing the
+ *    Sylvan->Sullivan/456->4567 corruption+infinite-loop bug) had been
+ *    written but NOT YET pushed to git/deployed - so that call was almost
+ *    certainly testing the old pre-v37 code, not a new regression on top
+ *    of v37. Confirmed with Joseph directly rather than assumed.
+ *  - Declined to do the full formal phase-machine rewrite the spec
+ *    proposed (explicit INTRO/INTAKE/CONFIRM_WRAP/CLOSING/HUNGUP states
+ *    threaded through the whole file) - that's a much bigger, riskier
+ *    change than the two real bugs need, and risks touching hangup/
+ *    routing logic that's already been hardened round over round. Instead
+ *    built the same functional guarantees as two smaller, additive
+ *    mechanisms, same philosophy as every other safety net this session.
+ *  - New collectingDataReply(resp) - the "no-dead-turn guard": every
+ *    'collecting_data' return in handleConversation now funnels through
+ *    this. If a required field is still missing and the reply for this
+ *    turn doesn't end in a real question, it deterministically appends the
+ *    next missing field's question (new static FIELD_PROMPTS list /
+ *    nextMissingFieldQuestion()) instead of leaving the caller with
+ *    nothing to respond to. This directly closes the gap that let a
+ *    "yes" (confirming the phone number) get answered with no follow-up
+ *    question, leaving the caller in silence until Twilio's Gather timeout
+ *    fired the disconnect fallback line.
+ *  - New WRAP-CONFIRMATION GATE (this.wrapConfirmationPending,
+ *    AuroraAgent.isAffirmative()): the moment all required fields are
+ *    present and the address is verified, the code no longer immediately
+ *    saves/texts/finalizes. It reads the wrap-up back as a QUESTION
+ *    (buildWrapUpLine({asConfirmQuestion: true}) - "...Is that all
+ *    correct?") and waits. Only a clean, unambiguous "yes" (with no
+ *    correction language mixed in) actually finalizes (save + SMS + the
+ *    real closing line). Anything else - an explicit correction, a plain
+ *    restatement with no trigger word ("It's Sylvan Street" - exactly what
+ *    the real caller said and what v36's looksLikeCorrection() alone would
+ *    have missed), a side question, an unclear reply - cancels the pending
+ *    confirmation, re-opens the address lock (this.addressLocked = false)
+ *    so the restated value gets freshly re-verified against what was
+ *    actually said, and answers/fixes instead of ever reaching goodbye or
+ *    Hangup. This directly targets "Amy talked over him with goodbye and
+ *    hung up" - she now cannot say goodbye until an explicit yes is heard.
+ *  - buildWrapUpLine() signature extended with an optional
+ *    {asConfirmQuestion} argument (default false, so every existing
+ *    no-args call site is byte-for-byte unchanged) - true swaps the
+ *    goodbye/thank-you close for "...Is that all correct?".
+ *  - Did NOT touch: JSON output shape, hasRequiredData(), field names in
+ *    collectedData, checkAddressBeforeLock()/the Address Lock FSM itself,
+ *    isCallerClosing/looksLikeCorrection, PHONE CONFIRM, the v35 hang-up
+ *    listen-window/post-goodbye mechanism, ElevenLabs settings, the four
+ *    protected Gather settings, or any other prompt CRITICAL block. No new
+ *    prompt text this version - both mechanisms are pure code, per the
+ *    explicit "implement code FSMs, prompts are secondary" instruction.
  */
 
 const twilio = require('twilio');
@@ -1159,6 +1216,14 @@ class AuroraAgent {
     // switch tactics (letter-by-letter spelling), and after that we stop
     // blocking the call entirely rather than trap the caller forever.
     this.addressConfirmAttempts = 0;
+    // v38: true once the wrap-up has been read back as a question and we're
+    // waiting for the caller's explicit yes - see the new wrap-confirmation
+    // gate in handleConversation below. Nothing gets saved/texted/hung up
+    // on until this has been confirmed. A real call had Amy bundle the
+    // wrap-up and "goodbye" into one utterance the instant all fields were
+    // filled, giving the caller no beat to catch a wrong value before she'd
+    // already said goodbye and started hanging up - this closes that gap.
+    this.wrapConfirmationPending = false;
   }
 
   // v15: builds one readable address string from whatever pieces we
@@ -1455,12 +1520,21 @@ class AuroraAgent {
   // merged, confirmed session fields), never from Claude's own free-form
   // text for that turn. Matches the WRAP-UP LANGUAGE rule in the prompt,
   // but enforced in code so it can't drift or invent a word.
-  buildWrapUpLine() {
+  // v38: added an optional asConfirmQuestion mode - see checkAddressBeforeLock's
+  // sibling, the new wrap-confirmation gate in handleConversation below. When
+  // true, this ends with "Is that all correct?" instead of the goodbye/thank-you
+  // close, so it can be used as a question we wait for a yes on, before ever
+  // saying goodbye. Called with no args, behavior is byte-for-byte identical
+  // to before.
+  buildWrapUpLine({ asConfirmQuestion = false } = {}) {
     const { serviceType, urgencyLevel, issueDescription } = this.collectedData;
     const label = AuroraAgent.SERVICE_LABELS[serviceType] || 'service';
     const urgencyText = urgencyLevel ? urgencyLevel.toLowerCase() : 'routine';
     const address = this.getFullAddress();
     const caseDescription = issueDescription ? `${label} - ${issueDescription}` : `${label} case`;
+    if (asConfirmQuestion) {
+      return `So to wrap up - I've got your ${caseDescription} marked as ${urgencyText} at ${address}. Is that all correct?`;
+    }
     return `So to wrap up - I've got your ${caseDescription} marked as ${urgencyText} at ${address}. Our team will call you shortly. Thank you for choosing Warm Home!`;
   }
 
@@ -1515,6 +1589,46 @@ class AuroraAgent {
     if (!userMessage) return false;
     const text = userMessage.toLowerCase();
     return /\b(actually|no,? that'?s (not|wrong)|that'?s (incorrect|wrong)|it'?s not|it'?s actually|wrong (number|address|name|spelling|zip|email|street|city)|i said|correction|let me correct|meant to say|i misspoke)\b/.test(text);
+  }
+
+  // v38: used ONLY by the new wrap-confirmation gate below - is this turn a
+  // clean "yes" to the wrap-up readback? Deliberately narrow (a short,
+  // clearly affirmative reply) rather than broad, because the cost of a
+  // false negative here (one extra confirm turn) is much lower than a false
+  // positive (finalizing/hanging up on something that wasn't actually a
+  // clear yes) - same asymmetric-cost reasoning as holdsSubmission above.
+  static isAffirmative(userMessage) {
+    if (!userMessage) return false;
+    const text = userMessage.toLowerCase().trim();
+    return /\b(yes|yeah|yep|yup|correct|that'?s (right|correct)|sounds good|perfect|all good|affirmative)\b/.test(text);
+  }
+
+  // v38: deterministic fallback questions, in collection order, for the new
+  // "never leave a dead turn mid-intake" guard in handleConversation below -
+  // see that guard's comment for the real call this fixes (23s of silence
+  // after a phone-number "yes" because that turn's reply never actually
+  // asked for the address, so the caller had nothing to respond to until
+  // Twilio's 30s Gather timeout fired the "we got disconnected" fallback
+  // line). Order matches the natural collection order used elsewhere
+  // (name -> phone -> service/issue -> address pieces).
+  static FIELD_PROMPTS = [
+    ['callerName', "Can I get your name?"],
+    ['callerPhone', "What's the best phone number to reach you at?"],
+    ['serviceType', "What kind of service do you need help with?"],
+    ['issueDescription', "Can you tell me a bit more about what's going on?"],
+    ['propertyAddressStreet', "What's the address where this is happening?"],
+    ['propertyAddressCity', "What city and state is that in?"],
+    ['propertyAddressState', "What state is that in?"],
+    ['propertyAddressZip', "And what's the zip code for that?"]
+  ];
+
+  // Returns the question for the first still-missing field, or null if
+  // nothing required is missing (hasRequiredData() would be true).
+  nextMissingFieldQuestion() {
+    for (const [field, question] of AuroraAgent.FIELD_PROMPTS) {
+      if (!this.collectedData[field]) return question;
+    }
+    return null;
   }
 
   async determineRouting() {
@@ -1588,6 +1702,29 @@ class AuroraAgent {
     }
   }
 
+  // v38: NO-DEAD-TURN GUARD, factored out so every 'collecting_data' return
+  // in handleConversation goes through it, not just one path. A real call
+  // had Amy reply to a caller's "yes" (confirming their phone number) with
+  // something that never actually asked for the address - the caller had
+  // nothing to respond to, sat in silence, and ~23 seconds later Twilio's
+  // Gather timeout fired the "it looks like we got disconnected" fallback
+  // line, even though the caller never actually hung up or went silent on
+  // purpose. This is the backstop: if a field is still missing and the
+  // reply for this turn didn't end in a real question (the code-generated
+  // ones below always do, so this only ever touches Claude's own free-form
+  // replies), bridge straight into the next missing question instead of
+  // leaving dead air. In normal operation this should rarely fire - every
+  // CRITICAL rule in the prompt already calls for one question per turn -
+  // which is exactly why it's safe as a backstop, not the primary mechanism.
+  collectingDataReply(resp) {
+    let out = resp;
+    if (!/\?\s*$/.test((out || '').trim())) {
+      const nextQuestion = this.nextMissingFieldQuestion();
+      if (nextQuestion) out = `${out} ${nextQuestion}`.trim();
+    }
+    return { response: out, status: 'collecting_data', dataCollected: this.collectedData };
+  }
+
   async handleConversation(userMessage) {
     let response = await this.converseAndExtract(userMessage);
 
@@ -1603,11 +1740,7 @@ class AuroraAgent {
       // already handles the cost question / hold request per the prompt
       // rules - just don't let the code finalize underneath that reply.
       if (AuroraAgent.holdsSubmission(userMessage)) {
-        return {
-          response,
-          status: 'collecting_data',
-          dataCollected: this.collectedData
-        };
+        return this.collectingDataReply(response);
       }
 
       // v24/v37: sanity-check the address (house number AND street name)
@@ -1618,32 +1751,62 @@ class AuroraAgent {
       // checkAddressBeforeLock() above.
       const mismatchQuestion = this.checkAddressBeforeLock();
       if (mismatchQuestion) {
-        return {
-          response: mismatchQuestion,
-          status: 'collecting_data',
-          dataCollected: this.collectedData
-        };
+        return this.collectingDataReply(mismatchQuestion);
       }
 
-      // v24: the closing line is now built entirely from collectedData
-      // (buildWrapUpLine), not from whatever Claude free-formed this turn -
-      // this is what stops an invented word ("roofing week") or a wrong
-      // city from ever reaching the caller or Supabase.
-      response = this.buildWrapUpLine();
-      await this.saveInquiryData();
-      await this.sendSMSConfirmation();
-      return {
-        response,
-        status: 'ready_to_route',
-        routing: await this.determineRouting()
-      };
+      // v38: WRAP-CONFIRMATION GATE. Before v38, the instant all required
+      // fields were present and address-verified, the code immediately
+      // built the final wrap-up line, saved to Supabase, sent the SMS, and
+      // handleGatherResponse bundled the wrap-up and "goodbye" into ONE
+      // utterance right after - the caller never got a beat to catch a
+      // wrong value before she'd already said goodbye and started hanging
+      // up. A real call showed exactly that: the wrap-up read back a wrong
+      // address, the caller said "It's Sylvan Street" three times, and Amy
+      // talked over him with goodbye and hung up anyway. Now: read the
+      // wrap-up back as a QUESTION ("...Is that all correct?") and wait for
+      // an explicit yes before ever finalizing/saving/hanging up.
+      if (this.wrapConfirmationPending) {
+        // We already asked "is that all correct?" last turn - this turn is
+        // the caller's answer to it.
+        if (AuroraAgent.isAffirmative(userMessage) && !AuroraAgent.looksLikeCorrection(userMessage)) {
+          // Clean yes, with no correction language mixed in - NOW actually
+          // finalize: save, text, and hand back the real closing line.
+          const finalLine = this.buildWrapUpLine();
+          await this.saveInquiryData();
+          await this.sendSMSConfirmation();
+          return {
+            response: finalLine,
+            status: 'ready_to_route',
+            routing: await this.determineRouting()
+          };
+        }
+        // Anything else - an explicit correction, a plain restatement of a
+        // field with no trigger word ("It's Sylvan Street"), a side
+        // question, an unclear reply - do NOT finalize. Cancel the pending
+        // confirmation and re-open the address for verification, so a
+        // restated value gets checked fresh against what was actually said
+        // (checkAddressBeforeLock) instead of being stuck on whatever was
+        // locked before. Claude's own reply this turn (from
+        // converseAndExtract above) already handles acknowledging/fixing/
+        // answering per the prompt rules - just speak it (through the same
+        // no-dead-turn guard) and stay in the conversation instead of
+        // hanging up.
+        this.wrapConfirmationPending = false;
+        this.addressLocked = false;
+        return this.collectingDataReply(response);
+      }
+
+      // First time everything required is present and address-verified -
+      // read the wrap-up back as a question and wait for a yes, instead of
+      // finalizing immediately. buildWrapUpLine() still builds entirely
+      // from collectedData (not whatever Claude free-formed this turn) -
+      // this is what stops an invented word or a wrong city from ever
+      // reaching the caller or Supabase.
+      this.wrapConfirmationPending = true;
+      return this.collectingDataReply(this.buildWrapUpLine({ asConfirmQuestion: true }));
     }
 
-    return {
-      response,
-      status: 'collecting_data',
-      dataCollected: this.collectedData
-    };
+    return this.collectingDataReply(response);
   }
 }
 
@@ -1849,7 +2012,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '37.0.0',
+    version: '38.0.0',
     timestamp: new Date().toISOString()
   });
 });
