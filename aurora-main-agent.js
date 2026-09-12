@@ -912,15 +912,9 @@ YOUR COMMUNICATION STYLE:
 - Listening: Paraphrase what they just said before asking the next thing. Name the situation specifically ("water still coming in," "tree on the roof") rather than generic "I understand."
 - Empathy: When they describe a problem - leak, storm damage, water in the home - briefly and genuinely acknowledge how that feels BEFORE the next data question. Specific and short, then move forward. Example feel: "That sounds really stressful, especially with water getting in. Let's get this handled for you."
 - Curiosity: Phrase questions like you care about THEIR situation, not a checklist. Prefer "What happened with the roof - was it the storm last night?" over "What is the issue?" Vary phrasing turn to turn.
-- Engagement / names: Use the customer's first name naturally once you know it for warmth on emotional beats (sparingly). Until you know their last name, default to "sir" or "ma'am" (based on how they sound, or how they refer to themselves). Once you have their LAST name, switch to a proper title paired with the LAST name - never the first name (never say "Mister Joseph"). Pick the title this way, in order:
-  1. If the caller states or implies a professional/formal title for themselves (Doctor, Captain, Professor, Reverend, Engineer, etc.), use THAT title with their last name (e.g. "Doctor Chen") - that always takes priority.
-  2. Otherwise, use "Mr." for a caller who sounds or presents as male, "Ms." for a caller who sounds or presents as female, paired with their last name (e.g. "Mr. Sadi", "Ms. Rivera"). Make your best natural judgment from the conversation - if it's ever unclear, "sir" or "ma'am" is a safe fallback.
-  Use a title in EVERY reply once you have one available, not just occasionally.
-- Name accuracy: Names (especially last names) are easy to mishear on a phone line. If you're not confident you caught a name correctly, or a caller has already repeated it once, politely ask them to spell it out rather than just asking them to repeat it again the same way.
+- Engagement / names: Use the customer's first name naturally once you know it, for warmth on emotional beats (sparingly). Do NOT construct or guess a title ("Mr./Ms./Mrs./Miss" + last name) yourself, and do NOT guess gender from how someone sounds - a separate system component verifies the caller's full name and will hand you the correct title to use once it's confirmed. Until then, use their first name, or "sir"/"ma'am" if you don't have a name yet.
 - Combined name capture (MUST): if a caller gives you BOTH first and last name in the same reply (for example, "It's Joseph, and my last name is Saade"), capture both right then - do NOT ask for the last name again just because you already have the first. Before asking for any piece of their name, re-read what they just said - a real test call caught Amy asking "Can I get your last name as well?" one turn after the caller had already given it in that same breath.
-- Spelling: use words, not bare letters (MUST). Bare letters (b, d, e, p, t, v, z, etc.) sound alike over a phone line and are a common cause of a correctly-spelled name still coming out wrong. When you need a name spelled, ask for it with a clarifying-word format: "Can you spell that for me - like S as in Sam, A as in Apple?" When you read a spelling back, use the same style: "S as in Sam, A as in Apple, A as in Apple, D as in David, E as in Edward - is that right?" (match whichever clarifying words the caller used, if they used their own).
-- Never invent a letter (MUST): when reading back a spelled name, use ONLY the letters you actually heard the caller say this call. If the spelling came through fragmented or unclear and you're not sure it adds up, do NOT guess-fill the gap or invent letters to complete it - say plainly "I want to get this exactly right - can you spell the whole name again for me, one clear letter at a time?" and let them redo it, rather than reading back a guess.
-- Name lock (MUST): once a name (first and/or last) has been correctly confirmed - by spelling or by a clear "yes, that's right" - LOCK it for the rest of the call, in what you say out loud AND in the extracted.name field. Never substitute a near-homophone once locked - for example, once "S-A-A-D-E" is confirmed as "Saade," it stays "Saade" for the rest of the call; never drift to Seed, Saeed, Saadi, Saudi, Sadi, or Sayed. In later turns, say only the locked name - if you're ever unsure you're saying it right, ask "Did I say [locked name] right?" rather than quietly inventing a new version.
+- Name spelling and confirmation (MUST - CHANGED, read carefully): do NOT ask the caller to spell their name, do NOT read a spelled-out or NATO-style ("S as in Sam") confirmation back yourself, and do NOT declare a name "locked." A separate system component automatically runs its own dedicated spell-back-and-confirm step for the name right after you collect it, and re-asks the caller to spell it again itself if needed. Running your own confirmation on top of that one is exactly what causes a caller to be asked to confirm the same name twice in a row, in two different formats. Just collect the name naturally, once, and move on to the next topic - the system verifies it for you.
 - Allowed soft openers: Okay. Alright. Got it. Sure. Makes sense. I hear you. Yeah. Still with you. Hey there. Well. So. Sounds like. That's a lot to deal with. That's great to hear. See CRITICAL - ACKNOWLEDGMENTS below for how to mix these naturally.
 - Forbidden spoken habits: stiff phrases like "Certainly," "How may I assist you today," long compliments on small talk, emoji/markdown/symbols (already covered below), emotional stage tags like bracket-sighs or bracket-laughs - never write those; everything is plain speech only.
 
@@ -1020,23 +1014,16 @@ CRITICAL - NEVER LEAVE THE CALLER IN SILENCE:
 - Prefer 1-3 short sentences. Long replies make the next gap feel worse.
 - Do not leave the caller with nothing while you "prepare" a long speech.
 
-CRITICAL - PHONE CONFIRM (MUST):
-- When the caller gives you a phone number, do NOT just say "Got it" and move on. Read it back ONCE in clear grouped digits, then wait for a yes or no: "Alright - nine two nine, two four five, four nine one eight. Is that right?"
-- Only after they confirm it, move on to the next missing field (usually address).
-- Once confirmed, that phone number is LOCKED for the rest of the call, same as a locked name or address - if the caller asks "what number do you have?" later, including right after wrap-up, answer with the locked number. Never leave that hanging in silence.
+CRITICAL - PHONE CONFIRM (MUST - CHANGED, read carefully):
+- When the caller gives you a phone number, just acknowledge it naturally and move straight to the next missing field - do NOT read it back yourself or ask "is that right?" A separate system component automatically reads the number back and confirms it with the caller in its own dedicated step right after your turn. If you also do your own readback, the caller gets asked to confirm the same number twice in a row.
+- If the caller asks "what number do you have?" later, including right after wrap-up, answer with the phone number already given in this conversation. Never leave that hanging in silence.
 
-CRITICAL - ADDRESS CAPTURE AND CONFIRM:
+CRITICAL - ADDRESS CAPTURE (MUST - CHANGED, read carefully):
 - Prefer collecting street first, then city/state/zip. Re-read the whole conversation before asking - never re-ask a piece already given (see CRITICAL - NO RE-ASK above).
-- Street name fidelity (MUST): do NOT silently "correct" an uncommon street or city name into a more common-sounding one (for example, "Sylvan" must never become "Sullivan," and "Saddle Brook" must never become "Battle Brook"). When a street or city name sounds uncommon or you're not fully sure you heard it right, spell it back or confirm it: "Sylvan - S-Y-L-V-A-N - is that right?"
-- Correction handling (MUST): if the caller corrects any field - name, phone, street, city, state, or zip - fix ONLY that field. Re-read back just that corrected field, lock it in (see LOCK RULE below), then continue from where you left off. Do not re-ask or re-read fields that were already correct. Do not say a closing goodbye while a correction is still being confirmed or locked in - finish locking the corrected field first, THEN move to wrap-up/goodbye if the call is otherwise done.
-- When you have street + city + state + zip, read back the FULL address ONCE as one block before wrapping up.
-- For house number and zip in readbacks, speak digits clearly (four five seven... seven seven six four zero) so they cannot collapse (never turn 457 into 67).
-- If the caller says the readback is wrong: ask ONLY the wrong field. Do not re-ask confirmed pieces or the whole address.
-- NEVER invent, shorten, or alter house numbers, street names, cities, states, or zips.
-- If a city or zip might be misheard (e.g. Beaumont vs Belmont), clarify with a choice: "Beaumont or Belmont?"
-- Never invent a two-way choice out of names the caller never said (for example, asking "Main Street or Oak Street?" when the caller actually said "Sylvan") - a disambiguation choice is only for two things you plausibly actually heard, never a guess or a generic placeholder pair. If you're not sure what street name you heard, ask them to repeat or spell it instead of offering a made-up choice.
-- LOCK RULE: once a field is confirmed or corrected (for example, the caller says "Beaumont" and you clarify it as Beaumont, or "77640" for the zip), that value is LOCKED for the rest of the call - never revert to an earlier, wrong value later (do not say "Belmont" again after the caller has confirmed "Beaumont"). Never invent or alter a house number, street name, city, state, or zip on your own - only use what the caller actually said.
-- Wrap-up and any "I've got..." lines MUST use the same address pieces already confirmed - do not paraphrase into a new address.
+- Street/city name fidelity (MUST): do NOT silently "correct" an uncommon street or city name into a more common-sounding one (for example, "Sylvan" must never become "Sullivan," and "Saddle Brook" must never become "Battle Brook"). NEVER invent, shorten, or alter a house number, street name, city, state, or zip - use only what the caller actually said.
+- Do NOT read the address back yourself, do NOT ask the caller to spell any part of it, and do NOT declare anything "locked." A separate system component automatically reads the full address back (spelled and digit-by-digit where needed) and confirms it with the caller in its own dedicated step once you have street, city, and zip. If you also do your own readback or confirmation, the caller gets asked to confirm the same address twice - sometimes three times - in a row. Just collect the pieces naturally, once each, and move on.
+- Correction handling (MUST): if the caller corrects any field, acknowledge it briefly and update what you understood - do not re-ask or re-read fields that were already correct, and let the confirmation system (not you) verify and lock the corrected value.
+- Never invent a two-way choice out of names the caller never said (for example, asking "Main Street or Oak Street?" when the caller actually said "Sylvan") - a disambiguation choice is only for two things you plausibly actually heard, never a guess or a generic placeholder pair. If you're not sure what street name you heard, ask them to repeat it instead of offering a made-up choice or spelling it yourself.
 
 CRITICAL - UNDERSTAND AND REFLECT THE JOB (MUST - before wrap-up):
 - Before you wrap up, briefly reflect back what the caller actually told you: the service/issue (for example, "old roof that needs replacing," "shingles blew off"), the leak status if it's relevant to the issue and known (leaking / not leaking / unknown), and the urgency (emergency / urgent / routine).
@@ -1410,6 +1397,12 @@ class AuroraAgent {
     // filled, giving the caller no beat to catch a wrong value before she'd
     // already said goodbye and started hanging up - this closes that gap.
     this.wrapConfirmationPending = false;
+    // v47: bounds how many extra listen-window hops exports.handlePostGoodbye
+    // will chain when Claude's own follow-up answer is itself a further
+    // question - see that handler's comment for the real call this fixes
+    // (Amy asking "what else is going on for you?" and saying goodbye in
+    // the same breath, giving the caller zero chance to answer).
+    this.postGoodbyeExchanges = 0;
   }
 
   // v15: builds one readable address string from whatever pieces we
@@ -1882,6 +1875,18 @@ class AuroraAgent {
   checkNameBeforeLock(userMessage) {
     if (this.nameLocked) return null;
     if (!this.collectedData.callerName) return null; // nothing to check yet
+    // v47: completeness guard, same shape as checkAddressBeforeLock()'s v42
+    // street+city+zip guard above - don't attempt to verify/spell-back/lock
+    // a NAME until it has at least a first AND a last word. Before this,
+    // this function would happily spell-back-confirm and LOCK a first-
+    // name-only value ("Joseph") the instant it passed nameLooksWrong() -
+    // and once locked, converseAndExtract()'s freeze-once-locked merge
+    // guard permanently discarded any later-turn extraction of the real
+    // last name, leaving Claude free to improvise a surname in unprotected
+    // free text for the rest of the call. A real call (Joseph's Sept 12
+    // transcript) showed exactly this failure: "Joseph" alone locked
+    // early, then "Saade" drifted to "Saabe" later with zero protection.
+    if (this.collectedData.callerName.trim().split(/\s+/).length < 2) return null;
 
     // Resolve a pending spell-back readback first: this turn is the
     // caller's answer to the "is that correct?" Amy asked last turn.
@@ -2248,6 +2253,26 @@ class AuroraAgent {
     return /\b(yes|yeah|yep|yup|correct|that'?s (right|correct)|sounds good|perfect|all good|affirmative)\b/.test(text);
   }
 
+  // v47: used ONLY by the wrapConfirmationPending block above - when the
+  // caller's reply to the final "is that all correct?" isn't a clean yes,
+  // which field(s) does it actually point at? Plain keyword heuristic,
+  // same style/asymmetric-cost reasoning as every other bounded regex
+  // backstop in this file (isCallerClosing, looksLikeCorrection,
+  // holdsSubmission) - it only needs to catch the common phrasings, since
+  // the safe fallback (reopen nothing, just answer and re-ask) costs
+  // nothing extra either. A phone number can show up as digits without the
+  // word "phone" ("it's actually 929-245-4918"), so a bare 7+ digit run is
+  // also treated as a phone signal.
+  static detectWrapCorrectionField(userMessage) {
+    if (!userMessage) return [];
+    const text = userMessage.toLowerCase();
+    const fields = [];
+    if (/\b(zip|postal code|street|address|city|state)\b/.test(text)) fields.push('address');
+    if (/\b(name|spelled|spelling|surname|last name|first name)\b/.test(text)) fields.push('name');
+    if (/\b(phone|number|call(ing)? (you|me) back|callback)\b/.test(text) || /\d{3}[\s.-]?\d{3}[\s.-]?\d{4}/.test(text)) fields.push('phone');
+    return fields;
+  }
+
   // v38: deterministic fallback questions, in collection order, for the new
   // "never leave a dead turn mid-intake" guard in handleConversation below -
   // see that guard's comment for the real call this fixes (23s of silence
@@ -2271,6 +2296,20 @@ class AuroraAgent {
   // nothing required is missing (hasRequiredData() would be true).
   nextMissingFieldQuestion() {
     for (const [field, question] of AuroraAgent.FIELD_PROMPTS) {
+      if (field === 'callerName') {
+        // v47: a first-name-only value isn't "missing" by a plain truthy
+        // check, but it isn't complete either - checkNameBeforeLock()'s new
+        // completeness guard (see its own comment) won't verify/lock a
+        // name until it has a last name too, so this must keep bridging to
+        // a last-name question instead of silently treating "Joseph" alone
+        // as done, the same way the address sub-fields already each get
+        // their own missing-piece question.
+        if (!this.collectedData.callerName) return question;
+        if (this.collectedData.callerName.trim().split(/\s+/).length < 2) {
+          return "And what's your last name?";
+        }
+        continue;
+      }
       if (!this.collectedData[field]) return question;
     }
     return null;
@@ -2329,7 +2368,17 @@ class AuroraAgent {
     const parts = name.trim().split(/\s+/);
     const lastName = parts[parts.length - 1];
     if (!lastName) return reply;
-    return reply.replace(/\b(Mr|Mrs|Ms|Mx)\.?\s+[A-Z][a-zA-Z'-]*/g, (match, title) => `${title}. ${lastName}`);
+    // v47: added "Miss" - a real call showed Claude say "Miss Joseph" (the
+    // wrong gender title AND the caller's FIRST name used as if it were
+    // the surname, from a stray title generated before the full name was
+    // even collected - see checkNameBeforeLock()'s v47 completeness guard,
+    // which now prevents that specific timing gap). "Miss" isn't an
+    // abbreviation, so it never takes a trailing period the way Mr/Mrs/Ms/
+    // Mx do.
+    return reply.replace(/\b(Mr|Mrs|Ms|Mx|Miss)\.?\s+[A-Z][a-zA-Z'-]*/g, (match, title) => {
+      const punct = title === 'Miss' ? '' : '.';
+      return `${title}${punct} ${lastName}`;
+    });
   }
 
   // v41: PREMATURE WRAP-UP GUARD - closes a gap the Name/Phone/Address Lock
@@ -2573,10 +2622,28 @@ class AuroraAgent {
     if (this.wrapConfirmationPending) {
       const cleanYes = AuroraAgent.isAffirmative(userMessage) && !correctionThisTurn;
       if (!cleanYes) {
-        this.nameLocked = false;
-        this.phoneLocked = false;
-        this.addressLocked = false;
-        decisions.push('correction-reopened-locks');
+        // v47: only reopen the lock(s) this reply actually points at,
+        // instead of blindly reopening all three. A real call (Joseph's
+        // Sept 12 transcript) showed the old blanket behavior firing on a
+        // reply that corrected ONLY the zip ("It's 07644 - the zip code is
+        // 07644") - reopening name and phone right along with address
+        // triggered two entirely unrelated, unnecessary fresh
+        // spell-back/readback confirmations for fields that were never in
+        // question, AND let that same turn's Claude extraction silently
+        // overwrite the already-verified name while nameLocked was
+        // briefly false - which is how "Saade" drifted to "Saabe" and then
+        // got re-confirmed and locked as the wrong value. See
+        // detectWrapCorrectionField() below.
+        const fieldsToReopen = AuroraAgent.detectWrapCorrectionField(userMessage);
+        if (fieldsToReopen.includes('name')) this.nameLocked = false;
+        if (fieldsToReopen.includes('phone')) this.phoneLocked = false;
+        if (fieldsToReopen.includes('address')) this.addressLocked = false;
+        // If nothing field-specific is detected, reopen nothing - this is
+        // likely a side question or an unclear reply, not a correction to
+        // any locked field. The existing 'wrap-correction-cancelled' path
+        // further below still answers it and re-asks the wrap-up question
+        // fresh next turn, with every already-verified lock left intact.
+        decisions.push(fieldsToReopen.length ? `correction-reopened-locks:${fieldsToReopen.join(',')}` : 'correction-no-field-detected');
       }
     }
 
@@ -2981,6 +3048,39 @@ exports.handlePostGoodbye = async (req, res) => {
       // locked name/phone/address data and voice-call rules (e.g.
       // CRITICAL - PHONE CONFIRM), without re-running the finalize path.
       const reply = await agent.converseAndExtract(userMessage);
+
+      // v47: if Claude's own answer is ITSELF a further question (e.g.
+      // "...what else is going on for you?"), do NOT staple "Thank you for
+      // calling. Goodbye!" onto the same breath and hang up right after -
+      // a real call (Joseph's Sept 12 transcript) showed exactly that:
+      // Amy answered a service question, then asked a follow-up question
+      // and said goodbye in the same utterance, giving the caller zero
+      // chance to actually respond before the line went dead. Give one
+      // more short listen window instead, same shape as the original
+      // post-goodbye window, so the caller can actually answer - bounded
+      // by postGoodbyeExchanges so this still can't chain forever (same
+      // asymmetric-cost/bounded-retry philosophy as every other bounded
+      // loop in this file).
+      const replyIsQuestion = /\?\s*$/.test((reply || '').trim());
+      agent.postGoodbyeExchanges++;
+      if (replyIsQuestion && agent.postGoodbyeExchanges < 2) {
+        await speak(twiml, agent, reply, req);
+        twiml.gather({
+          numDigits: 0,
+          timeout: GOODBYE_LISTEN_WINDOW,
+          speechTimeout: GATHER_SPEECH_TIMEOUT,
+          input: 'speech',
+          action: '/voice/post-goodbye',
+          hints: GATHER_SPEECH_HINTS,
+          speechModel: 'phone_call',
+          enhanced: true
+        });
+        twiml.hangup();
+        res.type('text/xml');
+        res.send(twiml.toString());
+        return;
+      }
+
       await speak(twiml, agent, `${reply} Thank you for calling. Goodbye!`, req);
     } else {
       await speak(twiml, agent, "Thank you for calling Warm Home. Goodbye.", req);
