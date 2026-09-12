@@ -1777,6 +1777,13 @@ class AuroraAgent {
       // correct?" forever.
       this.addressSpellAttempts++;
       if (this.addressSpellAttempts >= 2 && !AuroraAgent.looksLikeCorrection(userMessage)) {
+        // v48: apply a pending raw street correction before giving up - see
+        // the matching fix in checkNameBeforeLock() above for why.
+        if (this.addressStreetRaw) {
+          this.collectedData.propertyAddressStreet = this.addressStreetRaw;
+          this.addressStreetRaw = null;
+          this.addressRawCorrectionAttempts = 0;
+        }
         console.warn(`⚠️ Address spell-confirm gate gave up after ${this.addressSpellAttempts} ambiguous replies - accepting "${this.getFullAddress()}" to avoid trapping the caller.`);
         this.addressLocked = true;
         return null;
@@ -1911,6 +1918,17 @@ class AuroraAgent {
       // identical spelled-back question forever.
       this.nameSpellAttempts++;
       if (this.nameSpellAttempts >= 2 && !AuroraAgent.looksLikeCorrection(userMessage)) {
+        // v48: apply a pending raw correction (if the caller gave one that
+        // never got a clean yes) before giving up - previously this locked
+        // whatever was ALREADY in collectedData and silently dropped
+        // callerNameRaw, discarding a correction the caller had actually
+        // given. See the matching fix in checkPhoneBeforeLock/
+        // checkAddressBeforeLock below.
+        if (this.callerNameRaw) {
+          this.collectedData.callerName = this.callerNameRaw;
+          this.callerNameRaw = null;
+          this.nameRawCorrectionAttempts = 0;
+        }
         console.warn(`⚠️ Name spell-confirm gate gave up after ${this.nameSpellAttempts} ambiguous replies - accepting "${this.collectedData.callerName}" to avoid trapping the caller.`);
         this.nameLocked = true;
         return null;
@@ -1985,6 +2003,13 @@ class AuroraAgent {
       // the identical spelled-back question forever.
       this.phoneSpellAttempts++;
       if (this.phoneSpellAttempts >= 2 && !AuroraAgent.looksLikeCorrection(userMessage)) {
+        // v48: apply a pending raw digit correction before giving up - see
+        // the matching fix in checkNameBeforeLock() above for why.
+        if (this.callerPhoneRaw) {
+          this.collectedData.callerPhone = this.callerPhoneRaw;
+          this.callerPhoneRaw = null;
+          this.phoneRawCorrectionAttempts = 0;
+        }
         console.warn(`⚠️ Phone spell-confirm gate gave up after ${this.phoneSpellAttempts} ambiguous replies - accepting "${this.collectedData.callerPhone}" to avoid trapping the caller.`);
         this.phoneLocked = true;
         return null;
@@ -2034,7 +2059,24 @@ class AuroraAgent {
 
     if (field === 'name') {
       this.nameRawCorrectionAttempts++;
-      const correctedText = AuroraAgent.titleCase(cleaned);
+      let correctedText = AuroraAgent.titleCase(cleaned);
+      // v48: a caller correcting a name often spells it in the same breath
+      // ("Sardi, s a g e" / "Sadi s a d e") - without this, those single
+      // letters were kept as separate "name words," producing a nonsense
+      // readback that spelled out only the very last letter (a real call
+      // showed exactly this). Collapse a trailing run of 2+ consecutive
+      // single-letter tokens into one word before anything else runs.
+      if (correctedText) {
+        const words = correctedText.trim().split(/\s+/);
+        let splitPoint = words.length;
+        while (splitPoint > 0 && words[splitPoint - 1].length === 1) splitPoint--;
+        const letterRun = words.slice(splitPoint);
+        if (letterRun.length >= 2) {
+          const joined = letterRun.join('');
+          const consolidated = joined.charAt(0).toUpperCase() + joined.slice(1).toLowerCase();
+          correctedText = [...words.slice(0, splitPoint), consolidated].join(' ').trim();
+        }
+      }
       if (correctedText && correctedText.trim().split(/\s+/).length === 1 && this.collectedData.callerName) {
         // The common real case: the caller only restated the LAST name
         // (e.g. "actually it's Saade, not Saadi") - keep the existing
@@ -2093,9 +2135,27 @@ class AuroraAgent {
     const suffixRe = /\b(street|st|road|rd|avenue|ave|drive|dr|lane|ln|court|ct|way|boulevard|blvd|place|pl|circle|cir)\.?\s*$/i;
     const suffixMatch = existingStreet.match(suffixRe);
     const suffix = suffixMatch ? ' ' + suffixMatch[0] : '';
-    const rawMatch = cleaned.match(/^\s*(\d+)?\s*(.*)$/);
+    // v48: a caller correcting the street often restates MORE than just the
+    // street - the whole address, or street+city+state together ("No, it's
+    // not. It's sovan Street Saddle Brook New Jersey.") - without scoping
+    // back down, the entire restated phrase was captured as "the street
+    // name" and spelled out as one unbroken run-on blob (a real call showed
+    // Amy spell "S-O-V-A-N-S-T-R-E-E-T-S-A-D-D-L-E-B-R-O-O-K-N-E-W-J-E-R-S-
+    // E-Y" as a single word). Strip any trailing zip/state/city the caller
+    // also said - using the values already on file - before treating what's
+    // left as the street. Order matters: peel off the zip, then the state,
+    // then the city, since that's the order they'd trail off in speech
+    // ("...Street, Saddle Brook, New Jersey 07644" or "...Street Saddle
+    // Brook New Jersey").
+    const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    let scoped = cleaned;
+    const { propertyAddressZip: knownZip, propertyAddressState: knownState, propertyAddressCity: knownCity } = this.collectedData;
+    if (knownZip) scoped = scoped.replace(new RegExp(`\\b${escapeRe(knownZip)}\\b\\s*,?\\s*$`, 'i'), '').trim();
+    if (knownState) scoped = scoped.replace(new RegExp(`\\b${escapeRe(knownState)}\\b\\s*,?\\s*$`, 'i'), '').trim();
+    if (knownCity) scoped = scoped.replace(new RegExp(`\\b${escapeRe(knownCity)}\\b\\s*,?\\s*$`, 'i'), '').trim();
+    const rawMatch = scoped.match(/^\s*(\d+)?\s*(.*)$/);
     const houseNumber = (rawMatch && rawMatch[1]) || (existingStreet.match(/^(\d+)/) || [])[1] || '';
-    let streetNameOnly = ((rawMatch && rawMatch[2]) || cleaned).replace(suffixRe, '').trim();
+    let streetNameOnly = ((rawMatch && rawMatch[2]) || scoped).replace(suffixRe, '').trim();
     streetNameOnly = AuroraAgent.titleCase(streetNameOnly) || existingStreet.replace(/^\d+\s*/, '').replace(suffixRe, '').trim();
     this.addressStreetRaw = `${houseNumber ? houseNumber + ' ' : ''}${streetNameOnly}${suffix}`.trim();
     decisions.push('raw-correction-address');
@@ -2206,7 +2266,22 @@ class AuroraAgent {
   // line of defense.
   static looksLikeCorrection(userMessage) {
     if (!userMessage) return false;
-    const text = userMessage.toLowerCase();
+    const text = userMessage.toLowerCase().trim();
+    // v48: a bare leading "No" ("No Joseph. Sardi s a g e.", "No, it's
+    // Joseph. Sadi s a d e.", "No, it's 9292454918.") is by far the most
+    // common real way a caller corrects something on a live call - real
+    // Render logs (Sept 12) showed exactly these phrasings all fail every
+    // alternative below, so they fell through as "ambiguous" instead of a
+    // correction. That burned through the 2-ambiguous-reply bound in
+    // checkNameBeforeLock()/checkPhoneBeforeLock()/checkAddressBeforeLock()
+    // and FORCE-LOCKED a wrong or stale value within 2 turns, silently
+    // discarding what the caller actually said. Checked separately from the
+    // phrase list since it's a much broader, single-word signal - safe here
+    // because every call site either only matters once a *SpellPending
+    // readback is already active (so "is that correct?" was JUST asked,
+    // making a leading "no" mean "not correct") or already requires
+    // isAffirmative() to also be false before this matters at all.
+    if (/^no\b/.test(text)) return true;
     return /\b(actually|no,? that'?s (not|wrong)|that'?s (incorrect|wrong)|it'?s not|it'?s actually|wrong (number|address|name|spelling|zip|email|street|city)|i said|correction|let me correct|meant to say|i misspoke)\b/.test(text);
   }
 
