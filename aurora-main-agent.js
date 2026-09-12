@@ -1605,6 +1605,17 @@ class AuroraAgent {
   // (locking the address as a side effect the first time it passes).
   checkAddressBeforeLock() {
     if (this.addressLocked) return null; // already verified - never re-check or re-ask
+    // v42: don't attempt to verify/lock until street, city, AND zip have
+    // ALL actually been given. This check used to only ever get called
+    // once hasRequiredData() was already true (which guaranteed all the
+    // address pieces existed) - now that it runs every turn (see the new
+    // Universal Lock Gate in handleConversation), calling it before the
+    // caller has given the full address would see every sub-check return
+    // "not wrong" (nothing to compare against yet) and incorrectly lock an
+    // EMPTY or PARTIAL address as fully verified, before city/zip were
+    // ever checked at all.
+    const { propertyAddressStreet, propertyAddressCity, propertyAddressZip } = this.collectedData;
+    if (!propertyAddressStreet || !propertyAddressCity || !propertyAddressZip) return null;
     const numberWrong = this.houseNumberLooksWrong();
     const nameWrong = this.streetNameLooksWrong();
     // v39: also check the city, not just the house number and street name
@@ -2025,16 +2036,68 @@ class AuroraAgent {
   // leaving dead air. In normal operation this should rarely fire - every
   // CRITICAL rule in the prompt already calls for one question per turn -
   // which is exactly why it's safe as a backstop, not the primary mechanism.
-  collectingDataReply(resp) {
+  // v42: STRUCTURED PER-TURN LOGGING - per Joseph's spec: log every turn
+  // with the lock/attempt state and what Claude tried to do, so a blocked
+  // reply is visible immediately in Render logs instead of requiring
+  // another recording+transcript to diagnose. One JSON line per turn -
+  // easy to grep ("BLOCKED", "FINALIZED") when chasing a specific call.
+  logTurn({ userMessage, claudeRawReply, decisions, finalReply, status }) {
+    try {
+      console.log('🧭 TURN_LOG ' + JSON.stringify({
+        turn: this._turnCounter,
+        callSid: this.callSid || null,
+        userMessage: userMessage || null,
+        claudeRawReply: claudeRawReply || null,
+        decisions: decisions && decisions.length ? decisions : ['passthrough'],
+        finalReply,
+        status,
+        locks: {
+          name: this.nameLocked,
+          phone: this.phoneLocked,
+          address: this.addressLocked
+        },
+        attempts: {
+          name: this.nameConfirmAttempts,
+          phone: this.phoneConfirmAttempts,
+          address: this.addressConfirmAttempts
+        },
+        wrapConfirmationPending: this.wrapConfirmationPending
+      }));
+    } catch (e) {
+      console.warn('⚠️ TURN_LOG logging failed (non-fatal):', e.message);
+    }
+  }
+
+  // v38: NO-DEAD-TURN GUARD, factored out so every 'collecting_data' return
+  // in handleConversation goes through it, not just one path. A real call
+  // had Amy reply to a caller's "yes" (confirming their phone number) with
+  // something that never actually asked for the address - the caller had
+  // nothing to respond to, sat in silence, and ~23 seconds later Twilio's
+  // Gather timeout fired the "it looks like we got disconnected" fallback
+  // line, even though the caller never actually hung up or went silent on
+  // purpose. This is the backstop: if a field is still missing and the
+  // reply for this turn didn't end in a real question (the code-generated
+  // ones below always do, so this only ever touches Claude's own free-form
+  // replies), bridge straight into the next missing question instead of
+  // leaving dead air. In normal operation this should rarely fire - every
+  // CRITICAL rule in the prompt already calls for one question per turn -
+  // which is exactly why it's safe as a backstop, not the primary mechanism.
+  // v42: takes an optional logCtx so every exit point of handleConversation
+  // logs through the same one place (see logTurn above).
+  collectingDataReply(resp, logCtx = {}) {
     let out = resp;
     if (!/\?\s*$/.test((out || '').trim())) {
       const nextQuestion = this.nextMissingFieldQuestion();
       if (nextQuestion) out = `${out} ${nextQuestion}`.trim();
     }
+    this.logTurn({ ...logCtx, finalReply: out, status: 'collecting_data' });
     return { response: out, status: 'collecting_data', dataCollected: this.collectedData };
   }
 
   async handleConversation(userMessage) {
+    this._turnCounter = (this._turnCounter || 0) + 1;
+    const decisions = [];
+
     // v39: if we're mid wrap-confirmation, decide BEFORE calling
     // converseAndExtract whether this turn's reply is a clean, uncorrected
     // "yes" - and if it's NOT, reopen all three locks right now, before
@@ -2047,16 +2110,19 @@ class AuroraAgent {
     // frozen out one turn too late, the same turn it was supposed to take
     // effect. Reopening here first is what lets a correction's own
     // extraction actually land.
+    const correctionThisTurn = AuroraAgent.looksLikeCorrection(userMessage);
     if (this.wrapConfirmationPending) {
-      const cleanYes = AuroraAgent.isAffirmative(userMessage) && !AuroraAgent.looksLikeCorrection(userMessage);
+      const cleanYes = AuroraAgent.isAffirmative(userMessage) && !correctionThisTurn;
       if (!cleanYes) {
         this.nameLocked = false;
         this.phoneLocked = false;
         this.addressLocked = false;
+        decisions.push('correction-reopened-locks');
       }
     }
 
     let response = await this.converseAndExtract(userMessage);
+    const claudeRawReply = response;
 
     if (!response || !response.trim()) {
       response = "I'm sorry, could you say that one more time for me?";
@@ -2069,11 +2135,48 @@ class AuroraAgent {
     // yet, and only replaces with data we already trust.
     response = this.substituteCorrectSurname(response);
 
+    // v42: UNIVERSAL LOCK GATE - per Joseph's spec: "Claude only extracts
+    // and replies, period" - the router (this code), not Claude, decides
+    // whether a wrap-up/goodbye is allowed to fire. Before v42, checkName/
+    // Phone/AddressBeforeLock() only ran once hasRequiredData() was true,
+    // right before wrap-up - so a corrupted field (e.g. "Silver Street"
+    // instead of "Sylvan") could sit unverified, and Amy could keep talking
+    // (including a hallucinated wrap-up) for several more turns before the
+    // check ever ran. Now these run on EVERY turn, immediately after
+    // extraction. If any already-collected identity field isn't locked yet,
+    // this HARD-STOPS the turn right here: Claude's own reply for this turn
+    // is discarded entirely, no wrap-up/goodbye/ElevenLabs-worthy line can
+    // reach the caller, and the only thing spoken is the router's own
+    // targeted question for that ONE field. Order: name first (everything
+    // Amy says out loud uses it), then phone, then address - never stack
+    // more than one correction into a single turn. checkAddressBeforeLock()
+    // itself won't fire until street+city+zip all actually exist (see its
+    // own v42 guard), so this is safe to call from turn one.
+    const nameQuestion = this.checkNameBeforeLock();
+    if (nameQuestion) {
+      decisions.push('BLOCKED-name-not-locked');
+      return this.collectingDataReply(nameQuestion, { userMessage, claudeRawReply, decisions });
+    }
+    const phoneQuestion = this.checkPhoneBeforeLock();
+    if (phoneQuestion) {
+      decisions.push('BLOCKED-phone-not-locked');
+      return this.collectingDataReply(phoneQuestion, { userMessage, claudeRawReply, decisions });
+    }
+    const addressQuestion = this.checkAddressBeforeLock();
+    if (addressQuestion) {
+      decisions.push('BLOCKED-address-not-locked');
+      return this.collectingDataReply(addressQuestion, { userMessage, claudeRawReply, decisions });
+    }
+
     // v41: PREMATURE WRAP-UP GUARD - see looksLikePrematureWrapUp() above.
     // Only acts while hasRequiredData() is false, so this can never touch
-    // the real, code-gated wrap-up later in this function.
+    // the real, code-gated wrap-up later in this function. Complements the
+    // gate above: the gate above catches a field that's WRONG, this catches
+    // Amy narrating a wrap-up while the case is simply still INCOMPLETE
+    // (e.g. zip not given yet) - nothing "wrong" for the gate to flag, but
+    // still not ready to wrap.
     if (!this.hasRequiredData() && AuroraAgent.looksLikePrematureWrapUp(response)) {
-      console.warn('⚠️ Premature wrap-up guard caught Amy narrating a wrap-up-shaped sentence before all fields were collected/verified - bridging to the next question instead.');
+      decisions.push('premature-wrap-suppressed');
       const bridgeQuestion = this.nextMissingFieldQuestion();
       response = bridgeQuestion
         ? `Let's make sure I have everything first. ${bridgeQuestion}`
@@ -2087,10 +2190,10 @@ class AuroraAgent {
     // caller correcting a field is exactly when Amy legitimately needs to
     // talk about that field again. See looksLikeReAsk()/REASK_PATTERNS
     // above for the real call this closes.
-    if (!AuroraAgent.looksLikeCorrection(userMessage)) {
+    if (!correctionThisTurn) {
       const reaskedField = this.looksLikeReAsk(response);
       if (reaskedField) {
-        console.warn(`⚠️ No-re-ask guard caught Amy re-asking for "${reaskedField}", which was already collected this call - bridging to the next question instead.`);
+        decisions.push(`reask-suppressed-${reaskedField}`);
         const bridgeQuestion = this.nextMissingFieldQuestion();
         response = bridgeQuestion ? `Got it, thank you. ${bridgeQuestion}` : "Got it, thank you.";
       }
@@ -2104,45 +2207,22 @@ class AuroraAgent {
       // already handles the cost question / hold request per the prompt
       // rules - just don't let the code finalize underneath that reply.
       if (AuroraAgent.holdsSubmission(userMessage)) {
-        return this.collectingDataReply(response);
+        decisions.push('hold-submission');
+        return this.collectingDataReply(response, { userMessage, claudeRawReply, decisions });
       }
 
-      // v39: run all three identity-critical lock checks, in order - name
-      // first (everything Amy says out loud uses it), then phone, then the
-      // v37/v39 Address Lock FSM (house number, street name, AND city - see
-      // checkAddressBeforeLock() above). Ask about whichever ONE fails
-      // first; never stack more than one correction into a single turn.
-      // This replaces Claude's own turn reply with a direct clarifying
-      // question for this turn only when something doesn't check out.
-      const nameQuestion = this.checkNameBeforeLock();
-      if (nameQuestion) {
-        return this.collectingDataReply(nameQuestion);
-      }
-      const phoneQuestion = this.checkPhoneBeforeLock();
-      if (phoneQuestion) {
-        return this.collectingDataReply(phoneQuestion);
-      }
-      const mismatchQuestion = this.checkAddressBeforeLock();
-      if (mismatchQuestion) {
-        return this.collectingDataReply(mismatchQuestion);
-      }
-
-      // v39: WRAP ALLOWED GATE - explicit, single source of truth for
+      // v39/v42: WRAP ALLOWED GATE - explicit, single source of truth for
       // whether the call may enter/stay in wrap-confirmation, finalize,
-      // save, text, or hang up. True only once name, phone, AND address
-      // have each independently passed their own lock check (immediately
-      // above, this same turn) - never based on hasRequiredData() alone,
-      // since hasRequiredData() only checks that a field is non-empty, not
-      // that it was actually verified against what the caller said. By the
-      // time execution reaches here, all three checks above already ran
-      // and returned null (nothing to ask), so this is normally true - it
-      // exists as an explicit, auditable flag rather than an implicit
-      // side-effect of "we didn't return early above."
+      // save, text, or hang up. Since the Universal Lock Gate above already
+      // returns early the instant any collected field fails its check,
+      // reaching this line means name/phone/address all passed THIS turn -
+      // wrapAllowed should always be true here now. Kept as an explicit,
+      // defensive assertion (belt-and-suspenders) rather than trusting that
+      // nothing above can ever slip through.
       const wrapAllowed = this.nameLocked && this.phoneLocked && this.addressLocked;
       if (!wrapAllowed) {
-        // Defensive only - should be unreachable given the three checks
-        // above, but never finalize/wrap without it.
-        return this.collectingDataReply(response);
+        decisions.push('defensive-block-unreachable');
+        return this.collectingDataReply(response, { userMessage, claudeRawReply, decisions });
       }
 
       // v38: WRAP-CONFIRMATION GATE. Before v38, the instant all required
@@ -2159,12 +2239,14 @@ class AuroraAgent {
       if (this.wrapConfirmationPending) {
         // We already asked "is that all correct?" last turn - this turn is
         // the caller's answer to it.
-        if (AuroraAgent.isAffirmative(userMessage) && !AuroraAgent.looksLikeCorrection(userMessage)) {
+        if (AuroraAgent.isAffirmative(userMessage) && !correctionThisTurn) {
           // Clean yes, with no correction language mixed in - NOW actually
           // finalize: save, text, and hand back the real closing line.
           const finalLine = this.buildWrapUpLine();
           await this.saveInquiryData();
           await this.sendSMSConfirmation();
+          decisions.push('FINALIZED');
+          this.logTurn({ userMessage, claudeRawReply, decisions, finalReply: finalLine, status: 'ready_to_route' });
           return {
             response: finalLine,
             status: 'ready_to_route',
@@ -2193,7 +2275,8 @@ class AuroraAgent {
         // instead of hanging up. Just cancel the pending confirmation
         // itself here - the locks are already handled.
         this.wrapConfirmationPending = false;
-        return this.collectingDataReply(response);
+        decisions.push('wrap-correction-cancelled');
+        return this.collectingDataReply(response, { userMessage, claudeRawReply, decisions });
       }
 
       // First time everything required is present and verified - read the
@@ -2203,10 +2286,11 @@ class AuroraAgent {
       // this is what stops an invented word or a wrong city from ever
       // reaching the caller or Supabase.
       this.wrapConfirmationPending = true;
-      return this.collectingDataReply(this.buildWrapUpLine({ asConfirmQuestion: true }));
+      decisions.push('wrap-confirm-asked');
+      return this.collectingDataReply(this.buildWrapUpLine({ asConfirmQuestion: true }), { userMessage, claudeRawReply, decisions });
     }
 
-    return this.collectingDataReply(response);
+    return this.collectingDataReply(response, { userMessage, claudeRawReply, decisions });
   }
 }
 
