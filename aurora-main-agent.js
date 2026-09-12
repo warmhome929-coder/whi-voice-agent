@@ -1302,6 +1302,28 @@ class AuroraAgent {
     this.nameConfirmAttempts = 0;
     this.phoneLocked = false;
     this.phoneConfirmAttempts = 0;
+    // v43: MANDATORY SPELL-BACK CONFIRMATION - per Joseph's spec, don't
+    // silently lock a field just because the automated wasActuallySaid()/
+    // digit cross-check found nothing wrong. Instead, once a field passes
+    // that check, Amy reads it back spelled/digit-by-digit and waits for
+    // an explicit "yes" - only THAT locks the field. True while we're
+    // waiting on the caller's answer to one of these readbacks; see
+    // checkNameBeforeLock()/checkPhoneBeforeLock()/checkAddressBeforeLock().
+    this.nameSpellPending = false;
+    this.phoneSpellPending = false;
+    this.addressSpellPending = false;
+    // v43: bounded-retry counters for the spell-back CONFIRMATION step
+    // itself (separate from nameConfirmAttempts/etc above, which bound the
+    // "this field looks WRONG" escalation). Without this, a caller giving
+    // an ambiguous answer to "Is that correct?" (neither a clean yes nor a
+    // recognizable correction) would fall through, re-evaluate, find
+    // nothing "wrong" again, and ask the identical spelled-back question
+    // forever - a new mystery-loop shape, just one step later than the one
+    // v42's logging was built to catch. See the give-up branch in each
+    // checkXBeforeLock() below.
+    this.nameSpellAttempts = 0;
+    this.phoneSpellAttempts = 0;
+    this.addressSpellAttempts = 0;
     // v38: true once the wrap-up has been read back as a question and we're
     // waiting for the caller's explicit yes - see the new wrap-confirmation
     // gate in handleConversation below. Nothing gets saved/texted/hung up
@@ -1522,6 +1544,26 @@ class AuroraAgent {
   // alone wasn't holding under that pressure, so this is the code-level
   // backstop: does the street-name word actually appear anywhere in what
   // the caller said this call?
+  // v43: renders a word letter-by-letter for Amy's own spelled-back
+  // confirmation readback, e.g. "Saade" -> "S-A-A-D-E". This is Amy
+  // reading a value back FOR the caller to confirm - different direction
+  // from the existing "can you spell that for me" escalation (that's the
+  // CALLER spelling TO Amy when something looked wrong). Plain letters,
+  // not full phonetic-alphabet ("S as in Sam") - Joseph's own real-call
+  // transcript showed plain spelled letters read back clearly on a real
+  // line ("Sylvan Street, S-Y-L-V-A-N").
+  spellOut(value) {
+    if (!value) return '';
+    return value.toUpperCase().split('').filter(ch => /[A-Z]/.test(ch)).join('-');
+  }
+
+  // v43: same idea as spellOut(), for digit sequences (phone, house
+  // number, zip) - e.g. "9292454918" -> "9-2-9-2-4-5-4-9-1-8".
+  digitsOut(value) {
+    if (!value) return '';
+    return value.replace(/\D/g, '').split('').join('-');
+  }
+
   wasActuallySaid(word) {
     if (!word) return true; // nothing to check
     const clean = word.toLowerCase().replace(/[^a-z]/g, '');
@@ -1603,7 +1645,7 @@ class AuroraAgent {
   // Returns a clarifying question string if the caller should be asked
   // something before we finalize, or null if it's fine to proceed
   // (locking the address as a side effect the first time it passes).
-  checkAddressBeforeLock() {
+  checkAddressBeforeLock(userMessage) {
     if (this.addressLocked) return null; // already verified - never re-check or re-ask
     // v42: don't attempt to verify/lock until street, city, AND zip have
     // ALL actually been given. This check used to only ever get called
@@ -1614,8 +1656,29 @@ class AuroraAgent {
     // "not wrong" (nothing to compare against yet) and incorrectly lock an
     // EMPTY or PARTIAL address as fully verified, before city/zip were
     // ever checked at all.
-    const { propertyAddressStreet, propertyAddressCity, propertyAddressZip } = this.collectedData;
+    const { propertyAddressStreet, propertyAddressCity, propertyAddressState, propertyAddressZip } = this.collectedData;
     if (!propertyAddressStreet || !propertyAddressCity || !propertyAddressZip) return null;
+
+    // v43: MANDATORY SPELL-BACK CONFIRMATION - resolve a pending readback
+    // first, same as checkNameBeforeLock()/checkPhoneBeforeLock() above.
+    if (this.addressSpellPending) {
+      this.addressSpellPending = false;
+      if (AuroraAgent.isAffirmative(userMessage) && !AuroraAgent.looksLikeCorrection(userMessage)) {
+        this.addressLocked = true;
+        return null;
+      }
+      // Not a clean yes. If the caller gave an actual correction, fall
+      // through and let the wrongness checks below catch and escalate it
+      // normally. If not - a genuinely ambiguous answer - bound this so it
+      // can't ask the identical "is that correct?" forever.
+      this.addressSpellAttempts++;
+      if (this.addressSpellAttempts >= 2 && !AuroraAgent.looksLikeCorrection(userMessage)) {
+        console.warn(`⚠️ Address spell-confirm gate gave up after ${this.addressSpellAttempts} ambiguous replies - accepting "${this.getFullAddress()}" to avoid trapping the caller.`);
+        this.addressLocked = true;
+        return null;
+      }
+    }
+
     const numberWrong = this.houseNumberLooksWrong();
     const nameWrong = this.streetNameLooksWrong();
     // v39: also check the city, not just the house number and street name
@@ -1627,8 +1690,18 @@ class AuroraAgent {
     const zipWrong = this.zipLooksWrong();
 
     if (!numberWrong && !nameWrong && !cityWrong && !zipWrong) {
-      this.addressLocked = true;
-      return null;
+      // v43: automated check passed - now read the full address back
+      // (street name spelled, house number/zip digit-by-digit) and
+      // require an explicit yes before locking, same as name/phone.
+      this.addressSpellPending = true;
+      const houseNumberMatch = propertyAddressStreet.match(/^(\d+)/);
+      const houseNumber = houseNumberMatch ? houseNumberMatch[1] : '';
+      const streetNameOnly = propertyAddressStreet
+        .replace(/^\d+\s*/, '')
+        .replace(/\b(street|st|road|rd|avenue|ave|drive|dr|lane|ln|court|ct|way|boulevard|blvd|place|pl|circle|cir)\.?\s*$/i, '')
+        .trim();
+      const statePart = propertyAddressState ? `, ${propertyAddressState}` : '';
+      return `Let me confirm your address - ${this.digitsOut(houseNumber)} ${this.spellOut(streetNameOnly)}, ${propertyAddressCity}${statePart}, ${this.digitsOut(propertyAddressZip)}. Is that correct?`;
     }
 
     this.addressConfirmAttempts++;
@@ -1688,26 +1761,59 @@ class AuroraAgent {
     return !name.trim().split(/\s+/).every(word => this.wasActuallySaid(word));
   }
 
-  // Same shape as checkAddressBeforeLock(): verify once, lock it, bounded
-  // retries (targeted re-ask, then letter-by-letter spelling, then accept
-  // unverified rather than trap the caller in a loop).
-  checkNameBeforeLock() {
+  // v43: MANDATORY SPELL-BACK CONFIRMATION added on top of the existing
+  // bounded-retry shape, per Joseph's spec: never lock on the first try,
+  // even when the automated check finds nothing wrong - Amy must read the
+  // name back (last name spelled out) and get an explicit "yes" before
+  // this locks. Only the escalation path for an ACTUAL mismatch (targeted
+  // re-ask, then caller-spells-it-for-Amy, then accept-unverified after 3
+  // attempts) is unchanged from v39.
+  checkNameBeforeLock(userMessage) {
     if (this.nameLocked) return null;
     if (!this.collectedData.callerName) return null; // nothing to check yet
-    if (!this.nameLooksWrong()) {
-      this.nameLocked = true;
-      return null;
+
+    // Resolve a pending spell-back readback first: this turn is the
+    // caller's answer to the "is that correct?" Amy asked last turn.
+    if (this.nameSpellPending) {
+      this.nameSpellPending = false;
+      if (AuroraAgent.isAffirmative(userMessage) && !AuroraAgent.looksLikeCorrection(userMessage)) {
+        this.nameLocked = true;
+        return null;
+      }
+      // Not a clean yes - fall through and re-evaluate fresh below (any
+      // correction this turn was already merged into collectedData by
+      // converseAndExtract before this runs). Bounded the same way as
+      // checkAddressBeforeLock() above: an ambiguous (non-yes, non-
+      // correction) answer can't loop on the identical spelled-back
+      // question forever.
+      this.nameSpellAttempts++;
+      if (this.nameSpellAttempts >= 2 && !AuroraAgent.looksLikeCorrection(userMessage)) {
+        console.warn(`⚠️ Name spell-confirm gate gave up after ${this.nameSpellAttempts} ambiguous replies - accepting "${this.collectedData.callerName}" to avoid trapping the caller.`);
+        this.nameLocked = true;
+        return null;
+      }
     }
-    this.nameConfirmAttempts++;
-    if (this.nameConfirmAttempts >= 3) {
-      console.warn(`⚠️ Name lock gate gave up after ${this.nameConfirmAttempts} attempts - accepting "${this.collectedData.callerName}" unverified to avoid trapping the caller.`);
-      this.nameLocked = true;
-      return null;
+
+    if (this.nameLooksWrong()) {
+      this.nameConfirmAttempts++;
+      if (this.nameConfirmAttempts >= 3) {
+        console.warn(`⚠️ Name lock gate gave up after ${this.nameConfirmAttempts} attempts - accepting "${this.collectedData.callerName}" unverified to avoid trapping the caller.`);
+        this.nameLocked = true;
+        return null;
+      }
+      if (this.nameConfirmAttempts === 1) {
+        return "I want to make sure I have your name exactly right - can you say your full name for me one more time?";
+      }
+      return "Let's spell it out to be sure - can you spell your full name for me, one clear letter at a time, like S as in Sam?";
     }
-    if (this.nameConfirmAttempts === 1) {
-      return "I want to make sure I have your name exactly right - can you say your full name for me one more time?";
-    }
-    return "Let's spell it out to be sure - can you spell your full name for me, one clear letter at a time, like S as in Sam?";
+
+    // Automated check passed - now read it back spelled and require an
+    // explicit yes before locking.
+    this.nameSpellPending = true;
+    const parts = this.collectedData.callerName.trim().split(/\s+/);
+    const last = parts[parts.length - 1];
+    const first = parts.slice(0, -1).join(' ');
+    return `Let me make sure I have your name exactly right - ${first ? first + ' ' : ''}${this.spellOut(last)}. Is that correct?`;
   }
 
   // v39: PHONE LOCK FSM - lighter-weight than the name/address checks (no
@@ -1728,20 +1834,42 @@ class AuroraAgent {
     return !joinedDigits.includes(digitsOnly) && !this.rawDigitsHeard.includes(digitsOnly);
   }
 
-  checkPhoneBeforeLock() {
+  // v43: same MANDATORY SPELL-BACK CONFIRMATION addition as
+  // checkNameBeforeLock() above - never lock on the first try, always read
+  // the digits back and get an explicit yes.
+  checkPhoneBeforeLock(userMessage) {
     if (this.phoneLocked) return null;
     if (!this.collectedData.callerPhone) return null;
-    if (!this.phoneLooksWrong()) {
-      this.phoneLocked = true;
-      return null;
+
+    if (this.phoneSpellPending) {
+      this.phoneSpellPending = false;
+      if (AuroraAgent.isAffirmative(userMessage) && !AuroraAgent.looksLikeCorrection(userMessage)) {
+        this.phoneLocked = true;
+        return null;
+      }
+      // Bounded the same way as checkNameBeforeLock()/checkAddressBeforeLock()
+      // above - an ambiguous (non-yes, non-correction) answer can't loop on
+      // the identical spelled-back question forever.
+      this.phoneSpellAttempts++;
+      if (this.phoneSpellAttempts >= 2 && !AuroraAgent.looksLikeCorrection(userMessage)) {
+        console.warn(`⚠️ Phone spell-confirm gate gave up after ${this.phoneSpellAttempts} ambiguous replies - accepting "${this.collectedData.callerPhone}" to avoid trapping the caller.`);
+        this.phoneLocked = true;
+        return null;
+      }
     }
-    this.phoneConfirmAttempts++;
-    if (this.phoneConfirmAttempts >= 3) {
-      console.warn(`⚠️ Phone lock gate gave up after ${this.phoneConfirmAttempts} attempts - accepting "${this.collectedData.callerPhone}" unverified to avoid trapping the caller.`);
-      this.phoneLocked = true;
-      return null;
+
+    if (this.phoneLooksWrong()) {
+      this.phoneConfirmAttempts++;
+      if (this.phoneConfirmAttempts >= 3) {
+        console.warn(`⚠️ Phone lock gate gave up after ${this.phoneConfirmAttempts} attempts - accepting "${this.collectedData.callerPhone}" unverified to avoid trapping the caller.`);
+        this.phoneLocked = true;
+        return null;
+      }
+      return "I want to double check your callback number - can you read it back to me one more time, one digit at a time?";
     }
-    return "I want to double check your callback number - can you read it back to me one more time, one digit at a time?";
+
+    this.phoneSpellPending = true;
+    return `Let me confirm your callback number - ${this.digitsOut(this.collectedData.callerPhone)}. Is that correct?`;
   }
 
   // v24: readable label per service, used only for the code-generated
@@ -2061,6 +2189,14 @@ class AuroraAgent {
           phone: this.phoneConfirmAttempts,
           address: this.addressConfirmAttempts
         },
+        // v43: spell-back confirmation state, alongside the existing lock/
+        // attempts state - same reasoning as the rest of this log line, so
+        // a stuck "is that correct?" loop is visible in Render logs too.
+        spellPending: {
+          name: this.nameSpellPending,
+          phone: this.phoneSpellPending,
+          address: this.addressSpellPending
+        },
         wrapConfirmationPending: this.wrapConfirmationPending
       }));
     } catch (e) {
@@ -2084,14 +2220,34 @@ class AuroraAgent {
   // which is exactly why it's safe as a backstop, not the primary mechanism.
   // v42: takes an optional logCtx so every exit point of handleConversation
   // logs through the same one place (see logTurn above).
+  // v43: PAUSE BEFORE READBACK - per Joseph's spec: "after you say the name
+  // or address, make Amy pause one to two seconds before repeating it back.
+  // That gap lets Twilio finish processing and stops it from cutting you
+  // off." The turns where Amy is actually reading a name/phone/address
+  // value back are exactly the ones the Universal Lock Gate/wrap-confirm
+  // gate already tag with one of these decisions - so needsPause is derived
+  // straight from that same decisions array rather than re-detecting it
+  // from the reply text. BLOCKED-*-not-locked covers the targeted re-ask/
+  // spell-back-confirm questions from checkName/Phone/AddressBeforeLock();
+  // wrap-confirm-asked covers the final full-case readback.
+  static needsPauseFor(decisions) {
+    return (decisions || []).some(d =>
+      d === 'BLOCKED-name-not-locked' ||
+      d === 'BLOCKED-phone-not-locked' ||
+      d === 'BLOCKED-address-not-locked' ||
+      d === 'wrap-confirm-asked'
+    );
+  }
+
   collectingDataReply(resp, logCtx = {}) {
     let out = resp;
     if (!/\?\s*$/.test((out || '').trim())) {
       const nextQuestion = this.nextMissingFieldQuestion();
       if (nextQuestion) out = `${out} ${nextQuestion}`.trim();
     }
+    const needsPause = AuroraAgent.needsPauseFor(logCtx.decisions);
     this.logTurn({ ...logCtx, finalReply: out, status: 'collecting_data' });
-    return { response: out, status: 'collecting_data', dataCollected: this.collectedData };
+    return { response: out, status: 'collecting_data', dataCollected: this.collectedData, needsPause };
   }
 
   async handleConversation(userMessage) {
@@ -2152,17 +2308,17 @@ class AuroraAgent {
     // more than one correction into a single turn. checkAddressBeforeLock()
     // itself won't fire until street+city+zip all actually exist (see its
     // own v42 guard), so this is safe to call from turn one.
-    const nameQuestion = this.checkNameBeforeLock();
+    const nameQuestion = this.checkNameBeforeLock(userMessage);
     if (nameQuestion) {
       decisions.push('BLOCKED-name-not-locked');
       return this.collectingDataReply(nameQuestion, { userMessage, claudeRawReply, decisions });
     }
-    const phoneQuestion = this.checkPhoneBeforeLock();
+    const phoneQuestion = this.checkPhoneBeforeLock(userMessage);
     if (phoneQuestion) {
       decisions.push('BLOCKED-phone-not-locked');
       return this.collectingDataReply(phoneQuestion, { userMessage, claudeRawReply, decisions });
     }
-    const addressQuestion = this.checkAddressBeforeLock();
+    const addressQuestion = this.checkAddressBeforeLock(userMessage);
     if (addressQuestion) {
       decisions.push('BLOCKED-address-not-locked');
       return this.collectingDataReply(addressQuestion, { userMessage, claudeRawReply, decisions });
@@ -2250,7 +2406,11 @@ class AuroraAgent {
           return {
             response: finalLine,
             status: 'ready_to_route',
-            routing: await this.determineRouting()
+            routing: await this.determineRouting(),
+            // v43: this is the final locked-address/case readback - same
+            // pause-before-readback treatment as every other confirmation
+            // line (see needsPauseFor() above).
+            needsPause: true
           };
         }
         // Anything else - an explicit correction, a plain restatement of a
@@ -2315,7 +2475,16 @@ exports.handleCall = async (req, res) => {
       speechTimeout: 'auto',
       input: 'speech',
       action: '/voice/gather-response',
-      hints: GATHER_SPEECH_HINTS // v33: additive only, the four settings above are untouched
+      hints: GATHER_SPEECH_HINTS, // v33: additive only, the four settings above are untouched
+      // v43: additive only, same as hints above - speechModel 'phone_call'
+      // switches Twilio's speech recognition to the model tuned for phone
+      // call audio quality (vs its general-purpose default), and enhanced
+      // turns on the higher-accuracy version of that model. Per Joseph's
+      // spec: this is aimed specifically at names/addresses over a phone
+      // line, which is exactly where the real corruption bugs (Sylvan ->
+      // Sullivan, Saade -> Saadi, dropped phone digits) have come from.
+      speechModel: 'phone_call',
+      enhanced: true
     });
 
     await speak(gather, agent, greeting, req);
@@ -2354,6 +2523,13 @@ exports.handleGatherResponse = async (req, res) => {
     const result = await agent.handleConversation(userMessage);
 
     if (result.status === 'ready_to_route') {
+      // v43: PAUSE BEFORE READBACK - this line reads the full locked
+      // address back one final time, so it gets the same short pause as
+      // any other name/phone/address readback. See the main Gather branch
+      // below for the full reasoning.
+      if (result.needsPause) {
+        twiml.pause({ length: 2 });
+      }
       // Say the closing line and the goodbye together as ONE utterance so
       // there's no jarring switch to a different voice at the very end.
       await speak(twiml, agent, `${result.response} Thank you for calling. Goodbye!`, req);
@@ -2376,7 +2552,11 @@ exports.handleGatherResponse = async (req, res) => {
         speechTimeout: 'auto',
         input: 'speech',
         action: '/voice/post-goodbye',
-        hints: GATHER_SPEECH_HINTS
+        hints: GATHER_SPEECH_HINTS,
+        // v43: additive only, same as the main Gather below - see that
+        // comment for why.
+        speechModel: 'phone_call',
+        enhanced: true
       });
       twiml.hangup();
     } else if (AuroraAgent.isCallerClosing(userMessage) && !/\?\s*$/.test((result.response || '').trim()) && !AuroraAgent.looksLikeCorrection(userMessage)) {
@@ -2402,7 +2582,11 @@ exports.handleGatherResponse = async (req, res) => {
         speechTimeout: 'auto',
         input: 'speech',
         action: '/voice/post-goodbye',
-        hints: GATHER_SPEECH_HINTS
+        hints: GATHER_SPEECH_HINTS,
+        // v43: additive only, same as the main Gather below - see that
+        // comment for why.
+        speechModel: 'phone_call',
+        enhanced: true
       });
       twiml.hangup();
     } else {
@@ -2412,8 +2596,23 @@ exports.handleGatherResponse = async (req, res) => {
         speechTimeout: 'auto',
         input: 'speech',
         action: '/voice/gather-response',
-        hints: GATHER_SPEECH_HINTS // v33: additive only, the four settings above are untouched
+        hints: GATHER_SPEECH_HINTS, // v33: additive only, the four settings above are untouched
+        // v43: additive only - speechModel 'phone_call' + enhanced turn on
+        // Twilio's higher-accuracy speech recognition tuned for phone call
+        // audio. See the initial-greeting Gather above for the full
+        // reasoning.
+        speechModel: 'phone_call',
+        enhanced: true
       });
+      // v43: PAUSE BEFORE READBACK - when this turn's reply is Amy reading
+      // a name/phone/address value back for confirmation (or the final
+      // wrap-up), give a short pause first so the caller doesn't feel
+      // talked-over and Twilio's Gather isn't still settling from the
+      // caller's own last utterance. See needsPause in handleConversation/
+      // collectingDataReply for exactly which turns this applies to.
+      if (result.needsPause) {
+        gather.pause({ length: 2 });
+      }
       await speak(gather, agent, result.response, req);
 
       // v15: same conditional safety net as the initial greeting - only
