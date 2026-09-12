@@ -1481,7 +1481,16 @@ class AuroraAgent {
       this.collectedData.issueDescription &&
       this.collectedData.propertyAddressStreet &&
       this.collectedData.propertyAddressCity &&
-      this.collectedData.propertyAddressState
+      this.collectedData.propertyAddressState &&
+      // v41: zip was never in this list, even though FIELD_PROMPTS/
+      // checkAddressBeforeLock both treat it as one of the address pieces -
+      // a real call (Joseph's Sept 12 recording) showed the call reaching
+      // full wrap-up and hangup with NO zip ever collected, because nothing
+      // actually required it. The v40 zip verification only checks a zip
+      // that's already present - it never forced one to be collected in
+      // the first place. This closes that: zip is now required before the
+      // call can finalize, same as every other address piece.
+      this.collectedData.propertyAddressZip
     );
   }
 
@@ -1892,6 +1901,45 @@ class AuroraAgent {
     return null;
   }
 
+  // v41: TITLE-NAME SUBSTITUTION - a real call (Joseph's Sept 12 recording)
+  // showed Amy say "Thanks Mr. Saidi" mid-call for a caller named Saade -
+  // the JSON-extracted callerName stayed correct ("Joseph Saade") the whole
+  // time, so the Name Lock FSM (v39) had nothing to catch: that check only
+  // runs against collectedData at the hasRequiredData() gate, not against
+  // what Claude's free-text reply independently says out loud turn to
+  // turn. Since the correct surname is already known the moment callerName
+  // is collected, this always substitutes it into any "Mr./Mrs./Ms./Mx.
+  // <name>" Amy's reply contains - no drift-detection needed, because
+  // replacing with the known-correct value is strictly safer than trusting
+  // whatever the model free-generated.
+  substituteCorrectSurname(reply) {
+    const name = this.collectedData.callerName;
+    if (!name || !reply) return reply;
+    const parts = name.trim().split(/\s+/);
+    const lastName = parts[parts.length - 1];
+    if (!lastName) return reply;
+    return reply.replace(/\b(Mr|Mrs|Ms|Mx)\.?\s+[A-Z][a-zA-Z'-]*/g, (match, title) => `${title}. ${lastName}`);
+  }
+
+  // v41: PREMATURE WRAP-UP GUARD - closes a gap the Name/Phone/Address Lock
+  // FSMs don't cover: Claude's own free-text reply can independently
+  // free-generate a wrap-up-shaped sentence ("So to wrap up, I've got
+  // your...") BEFORE hasRequiredData() is even true and before any lock
+  // check has run. The same real call showed exactly this - Amy narrated
+  // "So to wrap up... at 456 Silver Street" (Sylvan corrupted to Silver)
+  // while the zip was still missing and nothing had been verified yet.
+  // The REAL wrap-up (buildWrapUpLine, used below) is entirely
+  // code-generated from verified collectedData and gated by
+  // hasRequiredData() plus the three lock checks - this only stops
+  // Claude's premature, unverified imitation of that sentence from
+  // reaching the caller with the same trust. Only fires when
+  // hasRequiredData() is false, so it can never touch the real, gated
+  // wrap-up - zero risk of blocking a legitimate one.
+  static looksLikePrematureWrapUp(reply) {
+    if (!reply) return false;
+    return /\b(so to wrap up|to wrap this up|wrapping up)\b.{0,40}\b(i'?ve got|i have got)\b/i.test(reply);
+  }
+
   async determineRouting() {
     const urgency = this.collectedData.urgencyLevel;
     const service = this.collectedData.serviceType;
@@ -2012,6 +2060,24 @@ class AuroraAgent {
 
     if (!response || !response.trim()) {
       response = "I'm sorry, could you say that one more time for me?";
+    }
+
+    // v41: always substitute the known-correct surname into any "Mr./Mrs./
+    // Ms." mention - see substituteCorrectSurname() above for the real
+    // "Thanks Mr. Saidi" (for a caller named Saade) this closes. Safe to
+    // run unconditionally: it does nothing when callerName isn't collected
+    // yet, and only replaces with data we already trust.
+    response = this.substituteCorrectSurname(response);
+
+    // v41: PREMATURE WRAP-UP GUARD - see looksLikePrematureWrapUp() above.
+    // Only acts while hasRequiredData() is false, so this can never touch
+    // the real, code-gated wrap-up later in this function.
+    if (!this.hasRequiredData() && AuroraAgent.looksLikePrematureWrapUp(response)) {
+      console.warn('⚠️ Premature wrap-up guard caught Amy narrating a wrap-up-shaped sentence before all fields were collected/verified - bridging to the next question instead.');
+      const bridgeQuestion = this.nextMissingFieldQuestion();
+      response = bridgeQuestion
+        ? `Let's make sure I have everything first. ${bridgeQuestion}`
+        : "Let's make sure I have everything first.";
     }
 
     // v40: NO-RE-ASK GUARD - if this turn's free-form reply looks like it's
