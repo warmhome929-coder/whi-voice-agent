@@ -1324,6 +1324,28 @@ class AuroraAgent {
     this.nameSpellAttempts = 0;
     this.phoneSpellAttempts = 0;
     this.addressSpellAttempts = 0;
+    // v44: RAW CORRECTION CAPTURE - per spec: "On correction, overwrite the
+    // _raw field immediately with the caller's exact spelling and read all
+    // spell-backs from _raw only. Never call Claude or rephrase between
+    // correction and spell-back. Set _locked true only after caller says
+    // yes to the spell-back." When the caller corrects a value WHILE
+    // Amy is mid-readback for that same value (one of the *SpellPending
+    // states above), the correction is captured directly from the
+    // caller's own words via handleRawCorrection() - no converseAndExtract/
+    // Claude call in between - and held here until they confirm it. See
+    // handleRawCorrection() below.
+    this.callerNameRaw = null;
+    this.callerPhoneRaw = null;
+    this.addressStreetRaw = null;
+    // v44: bounded-retry counters for the raw-correction cycle itself,
+    // separate from nameSpellAttempts/etc above (which bound an AMBIGUOUS
+    // non-answer, not a genuine repeated correction) - same defensive
+    // philosophy as every other bounded loop in this file: if the caller
+    // keeps correcting the same field and it still won't converge, accept
+    // the last correction given rather than trapping them indefinitely.
+    this.nameRawCorrectionAttempts = 0;
+    this.phoneRawCorrectionAttempts = 0;
+    this.addressRawCorrectionAttempts = 0;
     // v38: true once the wrap-up has been read back as a question and we're
     // waiting for the caller's explicit yes - see the new wrap-confirmation
     // gate in handleConversation below. Nothing gets saved/texted/hung up
@@ -1664,13 +1686,25 @@ class AuroraAgent {
     if (this.addressSpellPending) {
       this.addressSpellPending = false;
       if (AuroraAgent.isAffirmative(userMessage) && !AuroraAgent.looksLikeCorrection(userMessage)) {
+        // v44: if a raw correction was captured (see handleRawCorrection()
+        // below), THAT is what locks in - never whatever Claude's own
+        // extraction produced for this field - per the spec: "never call
+        // Claude or rephrase between correction and spell-back."
+        if (this.addressStreetRaw) {
+          this.collectedData.propertyAddressStreet = this.addressStreetRaw;
+          this.addressStreetRaw = null;
+          this.addressRawCorrectionAttempts = 0;
+        }
         this.addressLocked = true;
         return null;
       }
-      // Not a clean yes. If the caller gave an actual correction, fall
-      // through and let the wrongness checks below catch and escalate it
-      // normally. If not - a genuinely ambiguous answer - bound this so it
-      // can't ask the identical "is that correct?" forever.
+      // Not a clean yes. A real correction is normally intercepted earlier,
+      // before this function is even called (see the handleRawCorrection()
+      // short-circuit in handleConversation) - reaching here on a
+      // correction is a defensive fallback only. Either way, if it's not a
+      // clean yes and not a correction either - a genuinely ambiguous
+      // answer - bound this so it can't ask the identical "is that
+      // correct?" forever.
       this.addressSpellAttempts++;
       if (this.addressSpellAttempts >= 2 && !AuroraAgent.looksLikeCorrection(userMessage)) {
         console.warn(`⚠️ Address spell-confirm gate gave up after ${this.addressSpellAttempts} ambiguous replies - accepting "${this.getFullAddress()}" to avoid trapping the caller.`);
@@ -1777,15 +1811,22 @@ class AuroraAgent {
     if (this.nameSpellPending) {
       this.nameSpellPending = false;
       if (AuroraAgent.isAffirmative(userMessage) && !AuroraAgent.looksLikeCorrection(userMessage)) {
+        // v44: a raw correction (see handleRawCorrection()) locks in over
+        // whatever Claude's own extraction produced - per the spec.
+        if (this.callerNameRaw) {
+          this.collectedData.callerName = this.callerNameRaw;
+          this.callerNameRaw = null;
+          this.nameRawCorrectionAttempts = 0;
+        }
         this.nameLocked = true;
         return null;
       }
-      // Not a clean yes - fall through and re-evaluate fresh below (any
-      // correction this turn was already merged into collectedData by
-      // converseAndExtract before this runs). Bounded the same way as
-      // checkAddressBeforeLock() above: an ambiguous (non-yes, non-
-      // correction) answer can't loop on the identical spelled-back
-      // question forever.
+      // Not a clean yes. A real correction is normally intercepted earlier
+      // by the handleRawCorrection() short-circuit in handleConversation -
+      // reaching here on a correction is a defensive fallback only.
+      // Bounded the same way as checkAddressBeforeLock() above: an
+      // ambiguous (non-yes, non-correction) answer can't loop on the
+      // identical spelled-back question forever.
       this.nameSpellAttempts++;
       if (this.nameSpellAttempts >= 2 && !AuroraAgent.looksLikeCorrection(userMessage)) {
         console.warn(`⚠️ Name spell-confirm gate gave up after ${this.nameSpellAttempts} ambiguous replies - accepting "${this.collectedData.callerName}" to avoid trapping the caller.`);
@@ -1844,9 +1885,19 @@ class AuroraAgent {
     if (this.phoneSpellPending) {
       this.phoneSpellPending = false;
       if (AuroraAgent.isAffirmative(userMessage) && !AuroraAgent.looksLikeCorrection(userMessage)) {
+        // v44: a raw correction (see handleRawCorrection()) locks in over
+        // whatever Claude's own extraction produced - per the spec.
+        if (this.callerPhoneRaw) {
+          this.collectedData.callerPhone = this.callerPhoneRaw;
+          this.callerPhoneRaw = null;
+          this.phoneRawCorrectionAttempts = 0;
+        }
         this.phoneLocked = true;
         return null;
       }
+      // A real correction is normally intercepted earlier by the
+      // handleRawCorrection() short-circuit in handleConversation -
+      // reaching here on a correction is a defensive fallback only.
       // Bounded the same way as checkNameBeforeLock()/checkAddressBeforeLock()
       // above - an ambiguous (non-yes, non-correction) answer can't loop on
       // the identical spelled-back question forever.
@@ -1870,6 +1921,116 @@ class AuroraAgent {
 
     this.phoneSpellPending = true;
     return `Let me confirm your callback number - ${this.digitsOut(this.collectedData.callerPhone)}. Is that correct?`;
+  }
+
+  // v44: RAW CORRECTION CAPTURE - called from handleConversation() BEFORE
+  // converseAndExtract() runs, whenever the caller corrects a value while
+  // Amy is mid-readback for that exact value (nameSpellPending/
+  // phoneSpellPending/addressSpellPending). Per the spec: "overwrite the
+  // _raw field immediately with the caller's exact spelling and read all
+  // spell-backs from _raw only. Never call Claude or rephrase between
+  // correction and spell-back. Set _locked true only after caller says yes
+  // to the spell-back." This is plain text cleanup (stripCorrectionFiller/
+  // titleCase - both pure string ops, no API call, no interpretation) -
+  // deliberately NOT routed through Claude, since Claude's own extraction/
+  // rephrasing is exactly the kind of drift the spell-back readback exists
+  // to catch in the first place. The raw value is held in callerNameRaw/
+  // callerPhoneRaw/addressStreetRaw until the caller confirms THIS
+  // readback with a clean yes (see the *SpellPending resolution blocks
+  // above), at which point - and only then - it's copied into
+  // collectedData and the field locks.
+  handleRawCorrection(field, userMessage, decisions) {
+    // Same raw-speech/raw-digits bookkeeping converseAndExtract() would
+    // normally do this turn - it's the one side effect of that call the
+    // wrongness checks actually depend on, and converseAndExtract itself
+    // is deliberately skipped here (see the call site in handleConversation).
+    const digitsThisTurn = (userMessage || '').match(/\d+/g);
+    if (digitsThisTurn) this.rawDigitsHeard.push(...digitsThisTurn);
+    if (userMessage) this.rawSpeechHeard.push(userMessage);
+
+    const cleaned = AuroraAgent.stripCorrectionFiller(userMessage);
+
+    if (field === 'name') {
+      this.nameRawCorrectionAttempts++;
+      const correctedText = AuroraAgent.titleCase(cleaned);
+      if (correctedText && correctedText.trim().split(/\s+/).length === 1 && this.collectedData.callerName) {
+        // The common real case: the caller only restated the LAST name
+        // (e.g. "actually it's Saade, not Saadi") - keep the existing
+        // first name, replace only the last name, so a last-name-only
+        // correction doesn't silently drop the first name entirely.
+        const existingFirst = this.collectedData.callerName.trim().split(/\s+/).slice(0, -1).join(' ');
+        this.callerNameRaw = existingFirst ? `${existingFirst} ${correctedText}` : correctedText;
+      } else {
+        this.callerNameRaw = correctedText || this.collectedData.callerName;
+      }
+      decisions.push('raw-correction-name');
+      if (this.nameRawCorrectionAttempts >= 3) {
+        console.warn(`⚠️ Name raw-correction gate gave up after ${this.nameRawCorrectionAttempts} corrections - locking "${this.callerNameRaw}" as given to avoid trapping the caller.`);
+        this.collectedData.callerName = this.callerNameRaw;
+        this.callerNameRaw = null;
+        this.nameRawCorrectionAttempts = 0;
+        this.nameSpellPending = false;
+        this.nameLocked = true;
+        return this.collectingDataReply("Got it, thank you.", { userMessage, claudeRawReply: null, decisions });
+      }
+      this.nameSpellPending = true;
+      const parts = this.callerNameRaw.trim().split(/\s+/);
+      const last = parts[parts.length - 1];
+      const first = parts.slice(0, -1).join(' ');
+      const q = `Let me make sure I have your name exactly right - ${first ? first + ' ' : ''}${this.spellOut(last)}. Is that correct?`;
+      return this.collectingDataReply(q, { userMessage, claudeRawReply: null, decisions });
+    }
+
+    if (field === 'phone') {
+      this.phoneRawCorrectionAttempts++;
+      const digits = (userMessage.match(/\d+/g) || []).join('');
+      this.callerPhoneRaw = digits || this.collectedData.callerPhone;
+      decisions.push('raw-correction-phone');
+      if (this.phoneRawCorrectionAttempts >= 3) {
+        console.warn(`⚠️ Phone raw-correction gate gave up after ${this.phoneRawCorrectionAttempts} corrections - locking "${this.callerPhoneRaw}" as given to avoid trapping the caller.`);
+        this.collectedData.callerPhone = this.callerPhoneRaw;
+        this.callerPhoneRaw = null;
+        this.phoneRawCorrectionAttempts = 0;
+        this.phoneSpellPending = false;
+        this.phoneLocked = true;
+        return this.collectingDataReply("Got it, thank you.", { userMessage, claudeRawReply: null, decisions });
+      }
+      this.phoneSpellPending = true;
+      const q = `Let me confirm your callback number - ${this.digitsOut(this.callerPhoneRaw)}. Is that correct?`;
+      return this.collectingDataReply(q, { userMessage, claudeRawReply: null, decisions });
+    }
+
+    // field === 'address' - scoped to the STREET NAME specifically. That's
+    // the piece with the actual real-call corruption history in this
+    // project (Sylvan -> Sullivan/Silver) and the one piece a caller can
+    // cleanly restate/spell in isolation; city/state/zip corrections still
+    // go through the normal wrongness-check escalation, which already
+    // has its own spell-it-out step for those.
+    this.addressRawCorrectionAttempts++;
+    const existingStreet = this.collectedData.propertyAddressStreet || '';
+    const suffixRe = /\b(street|st|road|rd|avenue|ave|drive|dr|lane|ln|court|ct|way|boulevard|blvd|place|pl|circle|cir)\.?\s*$/i;
+    const suffixMatch = existingStreet.match(suffixRe);
+    const suffix = suffixMatch ? ' ' + suffixMatch[0] : '';
+    const rawMatch = cleaned.match(/^\s*(\d+)?\s*(.*)$/);
+    const houseNumber = (rawMatch && rawMatch[1]) || (existingStreet.match(/^(\d+)/) || [])[1] || '';
+    let streetNameOnly = ((rawMatch && rawMatch[2]) || cleaned).replace(suffixRe, '').trim();
+    streetNameOnly = AuroraAgent.titleCase(streetNameOnly) || existingStreet.replace(/^\d+\s*/, '').replace(suffixRe, '').trim();
+    this.addressStreetRaw = `${houseNumber ? houseNumber + ' ' : ''}${streetNameOnly}${suffix}`.trim();
+    decisions.push('raw-correction-address');
+    const { propertyAddressCity, propertyAddressState, propertyAddressZip } = this.collectedData;
+    const statePart = propertyAddressState ? `, ${propertyAddressState}` : '';
+    if (this.addressRawCorrectionAttempts >= 3) {
+      console.warn(`⚠️ Address raw-correction gate gave up after ${this.addressRawCorrectionAttempts} corrections - locking "${this.addressStreetRaw}" as given to avoid trapping the caller.`);
+      this.collectedData.propertyAddressStreet = this.addressStreetRaw;
+      this.addressStreetRaw = null;
+      this.addressRawCorrectionAttempts = 0;
+      this.addressSpellPending = false;
+      this.addressLocked = true;
+      return this.collectingDataReply("Got it, thank you.", { userMessage, claudeRawReply: null, decisions });
+    }
+    this.addressSpellPending = true;
+    const q = `Let me confirm your address - ${this.digitsOut(houseNumber)} ${this.spellOut(streetNameOnly)}, ${propertyAddressCity}${statePart}, ${this.digitsOut(propertyAddressZip)}. Is that correct?`;
+    return this.collectingDataReply(q, { userMessage, claudeRawReply: null, decisions });
   }
 
   // v24: readable label per service, used only for the code-generated
@@ -1962,6 +2123,37 @@ class AuroraAgent {
     if (!userMessage) return false;
     const text = userMessage.toLowerCase();
     return /\b(actually|no,? that'?s (not|wrong)|that'?s (incorrect|wrong)|it'?s not|it'?s actually|wrong (number|address|name|spelling|zip|email|street|city)|i said|correction|let me correct|meant to say|i misspoke)\b/.test(text);
+  }
+
+  // v44: plain TEXT CLEANUP ONLY - no Claude call, no semantic
+  // interpretation - strips the same correction lead-in phrases
+  // looksLikeCorrection() above already recognizes, plus a few common
+  // "the X is" lead-ins, so what's left is just the caller's own corrected
+  // value. Used by handleRawCorrection() below to capture a correction
+  // straight from the caller's words, per the spec: "overwrite the _raw
+  // field immediately with the caller's exact spelling... never call
+  // Claude or rephrase between correction and spell-back."
+  static stripCorrectionFiller(text) {
+    if (!text) return '';
+    return text
+      // A "...X, not Y" correction states the NEW value (X) before the
+      // disclaimer - cut the trailing "not <old value>" clause off first
+      // so it isn't left dangling in what we keep.
+      .replace(/,?\s*\bnot\s+.*$/i, '')
+      .replace(/\b(actually|no,?\s*(it|that)('?s| is) (not|wrong|incorrect)|(it|that)('?s| is) (not|wrong|incorrect)|(it|that)('?s| is) actually|still wrong|i said|correction|let me correct|meant to say|i misspoke|(it|that)('?s| is)|no,?|wrong|my name is|the (name|number|phone|street|address) is)\b/gi, ' ')
+      .replace(/[.,!?]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  // v44: pure capitalization (not a semantic rewrite) - "sylvan street" ->
+  // "Sylvan Street". Used only for how a raw-captured value is DISPLAYED/
+  // spoken; the actual letters/digits it's built from never change.
+  static titleCase(text) {
+    if (!text) return '';
+    return text.split(' ').filter(Boolean)
+      .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+      .join(' ');
   }
 
   // v38: used ONLY by the new wrap-confirmation gate below - is this turn a
@@ -2235,7 +2427,13 @@ class AuroraAgent {
       d === 'BLOCKED-name-not-locked' ||
       d === 'BLOCKED-phone-not-locked' ||
       d === 'BLOCKED-address-not-locked' ||
-      d === 'wrap-confirm-asked'
+      d === 'wrap-confirm-asked' ||
+      // v44: the raw-correction readbacks (handleRawCorrection()) are the
+      // same kind of "Amy is about to read a value back" turn as the
+      // BLOCKED-*-not-locked ones above - same pause treatment.
+      d === 'raw-correction-name' ||
+      d === 'raw-correction-phone' ||
+      d === 'raw-correction-address'
     );
   }
 
@@ -2267,6 +2465,31 @@ class AuroraAgent {
     // effect. Reopening here first is what lets a correction's own
     // extraction actually land.
     const correctionThisTurn = AuroraAgent.looksLikeCorrection(userMessage);
+
+    // v44: RAW CORRECTION CAPTURE - per spec: "On correction, overwrite the
+    // _raw field immediately with the caller's exact spelling and read all
+    // spell-backs from _raw only. Never call Claude or rephrase between
+    // correction and spell-back. Set _locked true only after caller says
+    // yes to the spell-back." If the caller corrects a value WHILE Amy is
+    // mid-readback for that exact value (one of the *SpellPending states
+    // v43 added), this turn must skip converseAndExtract entirely - Claude's
+    // own extraction/rephrasing is exactly the kind of drift the readback
+    // exists to catch, so routing a correction through it first (as every
+    // other turn does) would quietly reopen the same gap v43 closed, one
+    // step later. handleRawCorrection() below does the capture instead,
+    // with plain text ops only, no API call. At most one *SpellPending flag
+    // is ever true at a time (the Universal Lock Gate further below returns
+    // the instant one blocks), so these three checks can't collide.
+    if (this.nameSpellPending && correctionThisTurn) {
+      return this.handleRawCorrection('name', userMessage, decisions);
+    }
+    if (this.phoneSpellPending && correctionThisTurn) {
+      return this.handleRawCorrection('phone', userMessage, decisions);
+    }
+    if (this.addressSpellPending && correctionThisTurn) {
+      return this.handleRawCorrection('address', userMessage, decisions);
+    }
+
     if (this.wrapConfirmationPending) {
       const cleanYes = AuroraAgent.isAffirmative(userMessage) && !correctionThisTurn;
       if (!cleanYes) {
