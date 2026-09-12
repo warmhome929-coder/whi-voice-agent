@@ -1648,6 +1648,26 @@ class AuroraAgent {
     return value.replace(/\D/g, '').split('').join('-');
   }
 
+  // v50: a 10-digit phone number specifically needs grouping - a real call
+  // showed digitsOut()'s flat run ("9-2-9-2-4-5-4-9-1-8", all 10 digits in
+  // one unbroken breath) left the caller unable to tell if it was even
+  // right ("the way she says the number doesn't give a clear
+  // understanding"). A zip or house number is short enough to stay clear
+  // as a flat run (digitsOut is unchanged for those), but a phone number
+  // needs the same area-code/exchange/line grouping a person would say it
+  // in, so TTS actually pauses between groups instead of reading one long
+  // string of digits. Falls back to the plain flat run for anything that
+  // isn't a clean 10-digit number, so it never breaks on unexpected input.
+  digitsOutPhone(value) {
+    if (!value) return '';
+    const digits = value.replace(/\D/g, '');
+    if (digits.length !== 10) return this.digitsOut(value);
+    const area = digits.slice(0, 3).split('').join('-');
+    const exchange = digits.slice(3, 6).split('').join('-');
+    const line = digits.slice(6).split('').join('-');
+    return `${area}, ${exchange}, ${line}`;
+  }
+
   wasActuallySaid(word) {
     if (!word) return true; // nothing to check
     const clean = word.toLowerCase().replace(/[^a-z]/g, '');
@@ -1906,7 +1926,21 @@ class AuroraAgent {
     // free text for the rest of the call. A real call (Joseph's Sept 12
     // transcript) showed exactly this failure: "Joseph" alone locked
     // early, then "Saade" drifted to "Saabe" later with zero protection.
-    if (this.collectedData.callerName.trim().split(/\s+/).length < 2) return null;
+    // v50: this used to just `return null` here - silently doing nothing
+    // and trusting Claude's own free-form reply to eventually circle back
+    // and ask for the last name. A real call showed that trust misplaced:
+    // Claude moved straight on to phone/address for SEVEN turns with only
+    // "Joseph" on file, and the last-name question only got asked once the
+    // call was already closing out - stapled onto a goodbye by the
+    // dead-turn guard ("...Goodbye. And what's your last name?"), which is
+    // what actually triggered the caller's blow-up. Now this actively
+    // blocks and asks for it immediately, the same way an actually-WRONG
+    // name/phone/address already blocks every turn until it's resolved -
+    // consistent with the rest of the Universal Lock Gate instead of being
+    // the one silent exception in it.
+    if (this.collectedData.callerName.trim().split(/\s+/).length < 2) {
+      return this.nextMissingFieldQuestion();
+    }
 
     // Resolve a pending spell-back readback first: this turn is the
     // caller's answer to the "is that correct?" Amy asked last turn.
@@ -2040,7 +2074,7 @@ class AuroraAgent {
     }
 
     this.phoneSpellPending = true;
-    return `Let me confirm your callback number - ${this.digitsOut(this.collectedData.callerPhone)}. Is that correct?`;
+    return `Let me confirm your callback number - ${this.digitsOutPhone(this.collectedData.callerPhone)}. Is that correct?`;
   }
 
   // v44: RAW CORRECTION CAPTURE - called from handleConversation() BEFORE
@@ -2133,7 +2167,7 @@ class AuroraAgent {
         return this.collectingDataReply("Got it, thank you.", { userMessage, claudeRawReply: null, decisions });
       }
       this.phoneSpellPending = true;
-      const q = `Let me confirm your callback number - ${this.digitsOut(this.callerPhoneRaw)}. Is that correct?`;
+      const q = `Let me confirm your callback number - ${this.digitsOutPhone(this.callerPhoneRaw)}. Is that correct?`;
       return this.collectingDataReply(q, { userMessage, claudeRawReply: null, decisions });
     }
 
@@ -2218,6 +2252,17 @@ class AuroraAgent {
   // close, so it can be used as a question we wait for a yes on, before ever
   // saying goodbye. Called with no args, behavior is byte-for-byte identical
   // to before.
+  // v50: per Joseph's own dictated wording, these two variants are no longer
+  // near-duplicates of each other. A real call showed the SAME "So to wrap
+  // up - I've got your..." sentence spoken three times in one call (the
+  // confirm-question, a repeated confirm-question after a correction
+  // hiccup, and then the final goodbye reusing the same full sentence
+  // again) - reading as Amy "repeating herself." The confirm-question
+  // keeps the full case readback (the caller genuinely needs to hear every
+  // detail to verify it) but now opens with "Let me confirm" instead of
+  // "So to wrap up" - the final close is now a SHORT, DIFFERENT, one-time
+  // line that doesn't restate the case at all, since it was already read
+  // back and confirmed one turn earlier.
   buildWrapUpLine({ asConfirmQuestion = false } = {}) {
     const { serviceType, urgencyLevel, issueDescription } = this.collectedData;
     const label = AuroraAgent.SERVICE_LABELS[serviceType] || 'service';
@@ -2225,9 +2270,9 @@ class AuroraAgent {
     const address = this.getFullAddress();
     const caseDescription = issueDescription ? `${label} - ${issueDescription}` : `${label} case`;
     if (asConfirmQuestion) {
-      return `So to wrap up - I've got your ${caseDescription} marked as ${urgencyText} at ${address}. Is that all correct?`;
+      return `Let me confirm - I've got your ${caseDescription} marked as ${urgencyText} at ${address}. Is that all correct?`;
     }
-    return `So to wrap up - I've got your ${caseDescription} marked as ${urgencyText} at ${address}. Our team will call you shortly. Thank you for choosing Warm Home!`;
+    return `Okay, I've got all your information. I'll have somebody contact you within the hour, and we'll take it from there. Have a blessed day!`;
   }
 
   // v24: code-level backstop for the "DO NOT SEND THE CASE EARLY" prompt
@@ -2356,6 +2401,14 @@ class AuroraAgent {
     const text = userMessage.toLowerCase();
     const fields = [];
     if (/\b(zip|postal code|street|address|city|state)\b/.test(text)) fields.push('address');
+    // v50: a caller correcting the zip often just re-says the digits
+    // ("07640... 07644?") with no trigger word at all - a real call
+    // showed exactly this ("It's not it's 07644" was caught by the "zip"
+    // keyword, but a later bare "07640 07.644?" wasn't). \b\d{5}\b only
+    // matches a standalone 5-digit token (word boundaries on both sides),
+    // so it won't fire in the middle of a longer digit run like a phone
+    // number - a bare 5-digit number this late in the call is a zip.
+    if (!fields.includes('address') && /\b\d{5}\b/.test(text)) fields.push('address');
     if (/\b(name|spelled|spelling|surname|last name|first name)\b/.test(text)) fields.push('name');
     if (/\b(phone|number|call(ing)? (you|me) back|callback)\b/.test(text) || /\d{3}[\s.-]?\d{3}[\s.-]?\d{4}/.test(text)) fields.push('phone');
     return fields;
@@ -2486,6 +2539,35 @@ class AuroraAgent {
   static looksLikePrematureWrapUp(reply) {
     if (!reply) return false;
     return /\b(so to wrap up|to wrap this up|wrapping up)\b.{0,40}\b(i'?ve got|i have got)\b/i.test(reply);
+  }
+
+  // v50: detects that AMY'S OWN reply already closed the call out (a
+  // goodbye or "thank you for calling" line, or the new short one-time
+  // final closing) - different direction from isCallerClosing(), which
+  // reads the CALLER's message. Used to stop code from ever stapling
+  // something else onto a reply that already said goodbye. A real call
+  // showed two separate versions of this bug: collectingDataReply's
+  // dead-turn guard appended "And what's your last name?" onto "...Thank
+  // you for calling Warm Home. Goodbye." (reopening intake right after
+  // closing), and handlePostGoodbye appended a second "Thank you for
+  // calling. Goodbye!" onto a reply that was already Amy saying goodbye
+  // back to the caller's own "Goodbye" - producing "Goodbye" three times
+  // in the same short exchange.
+  static looksLikeGoodbye(reply) {
+    if (!reply) return false;
+    return /\b(goodbye|good bye|thank you for calling|have a (great|good|blessed) day)\b/i.test(reply);
+  }
+
+  // v50: a caller who is clearly frustrated or insulting ("You're stupid,
+  // I don't know what's going on with you") getting back the EXACT same
+  // scripted confirmation question, verbatim, with zero acknowledgment,
+  // reads as robotic and disrespectful - confirmed on a real call. This
+  // never touches the underlying verified-value lock logic - it only
+  // decides whether a brief, genuine "I'm sorry about that" gets prefixed
+  // onto the very same question the router was already about to repeat.
+  static looksHostile(text) {
+    if (!text) return false;
+    return /\b(stupid|idiot|dumb|ridiculous|useless|terrible|awful|shut up)\b/i.test(text) || /what('?s| is) wrong with you/i.test(text);
   }
 
   async determineRouting() {
@@ -2656,8 +2738,17 @@ class AuroraAgent {
 
   collectingDataReply(resp, logCtx = {}) {
     let out = resp;
-    if (!/\?\s*$/.test((out || '').trim())) {
-      const nextQuestion = this.nextMissingFieldQuestion();
+    const nextQuestion = this.nextMissingFieldQuestion();
+    // v50: a real call showed the dead-turn guard below appending a
+    // missing-field question onto a reply that had ALREADY said goodbye
+    // ("...Thank you for calling Warm Home. Goodbye. And what's your last
+    // name?") - reopening intake right after closing, the exact moment
+    // that call went off the rails. If something required is still
+    // missing, the premature goodbye itself is the actual problem here -
+    // drop it and ask the missing question instead of stapling after it.
+    if (nextQuestion && AuroraAgent.looksLikeGoodbye(out)) {
+      out = nextQuestion;
+    } else if (!/\?\s*$/.test((out || '').trim())) {
       if (nextQuestion) out = `${out} ${nextQuestion}`.trim();
     }
     const needsPause = AuroraAgent.needsPauseFor(logCtx.decisions);
@@ -2770,20 +2861,28 @@ class AuroraAgent {
     // more than one correction into a single turn. checkAddressBeforeLock()
     // itself won't fire until street+city+zip all actually exist (see its
     // own v42 guard), so this is safe to call from turn one.
+    // v50: if the router is about to repeat one of these blocking
+    // questions and the caller's reply reads as frustrated/hostile, prefix
+    // a brief, genuine acknowledgment instead of firing back the exact
+    // same scripted line with no reaction at all - a real call showed a
+    // caller called "stupid" and gotten the identical spelled-back
+    // question, verbatim, right back. Doesn't change which question gets
+    // asked or touch any verified-value logic - purely a one-line prefix.
+    const hostilePrefix = AuroraAgent.looksHostile(userMessage) ? "I'm sorry about that. " : '';
     const nameQuestion = this.checkNameBeforeLock(userMessage);
     if (nameQuestion) {
       decisions.push('BLOCKED-name-not-locked');
-      return this.collectingDataReply(nameQuestion, { userMessage, claudeRawReply, decisions });
+      return this.collectingDataReply(`${hostilePrefix}${nameQuestion}`, { userMessage, claudeRawReply, decisions });
     }
     const phoneQuestion = this.checkPhoneBeforeLock(userMessage);
     if (phoneQuestion) {
       decisions.push('BLOCKED-phone-not-locked');
-      return this.collectingDataReply(phoneQuestion, { userMessage, claudeRawReply, decisions });
+      return this.collectingDataReply(`${hostilePrefix}${phoneQuestion}`, { userMessage, claudeRawReply, decisions });
     }
     const addressQuestion = this.checkAddressBeforeLock(userMessage);
     if (addressQuestion) {
       decisions.push('BLOCKED-address-not-locked');
-      return this.collectingDataReply(addressQuestion, { userMessage, claudeRawReply, decisions });
+      return this.collectingDataReply(`${hostilePrefix}${addressQuestion}`, { userMessage, claudeRawReply, decisions });
     }
 
     // v41: PREMATURE WRAP-UP GUARD - see looksLikePrematureWrapUp() above.
@@ -2998,7 +3097,17 @@ exports.handleGatherResponse = async (req, res) => {
       }
       // Say the closing line and the goodbye together as ONE utterance so
       // there's no jarring switch to a different voice at the very end.
-      await speak(twiml, agent, `${result.response} Thank you for calling. Goodbye!`, req);
+      // v50: buildWrapUpLine()'s final variant is now a complete, self-
+      // contained sign-off on its own (per Joseph's dictated wording,
+      // ending in "Have a blessed day!") - only staple the generic "Thank
+      // you for calling. Goodbye!" on when the line doesn't already close
+      // things out, so the caller never hears two closings stacked back to
+      // back. A real call showed exactly that stacking: "...Thank you for
+      // choosing Warm Home! Thank you for calling. Goodbye."
+      const closingLine = AuroraAgent.looksLikeGoodbye(result.response)
+        ? result.response
+        : `${result.response} Thank you for calling. Goodbye!`;
+      await speak(twiml, agent, closingLine, req);
       // v35: HANG-UP PACING - leave a short listen window (~2s) before the
       // call actually ends, in case the caller is still talking (e.g.
       // "what number do you have?"). If they speak, Twilio POSTs to
@@ -3169,7 +3278,15 @@ exports.handlePostGoodbye = async (req, res) => {
         return;
       }
 
-      await speak(twiml, agent, `${reply} Thank you for calling. Goodbye!`, req);
+      // v50: a real call showed this stapling a second "Thank you for
+      // calling. Goodbye!" onto a reply that was ALREADY Amy saying
+      // goodbye back (the caller said "Goodbye" in the listen window,
+      // Claude's own natural reply to that was "Goodbye, Joseph. Thank
+      // you for calling.") - producing "Goodbye" three times across the
+      // exchange. Only add the generic close when the reply doesn't
+      // already have one.
+      const closingReply = AuroraAgent.looksLikeGoodbye(reply) ? reply : `${reply} Thank you for calling. Goodbye!`;
+      await speak(twiml, agent, closingReply, req);
     } else {
       await speak(twiml, agent, "Thank you for calling Warm Home. Goodbye.", req);
     }
