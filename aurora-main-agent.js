@@ -663,6 +663,80 @@
  *    protected Gather settings, or any other prompt CRITICAL block. No new
  *    prompt text this version - both mechanisms are pure code, per the
  *    explicit "implement code FSMs, prompts are secondary" instruction.
+ *
+ * v39 CHANGES (Name Lock FSM + Phone Lock FSM + explicit wrapAllowed gate +
+ * freeze-once-locked - from Joseph relaying another outside AI's explicit
+ * demand for code proof after two more real calls kept showing: the name
+ * still drifting Saade -> Saadi/Silver/etc., the street still drifting
+ * Sylvan -> Sullivan/Susan, the city still drifting Saddlebrook -> Battle
+ * Brook, and the wrap repeating while he corrects):
+ *  - CONFIRMED BY CODE INSPECTION BEFORE WRITING ANY OF THIS: the v37/v38
+ *    Address Lock FSM (checkAddressBeforeLock/houseNumberLooksWrong/
+ *    streetNameLooksWrong/wasActuallySaid/this.addressLocked) IS real code,
+ *    already in aurora-main-agent.js - confirmed by direct grep, cited with
+ *    line numbers in the reply that shipped alongside this version. But the
+ *    "Name lock (MUST)" and "PHONE CONFIRM" rules were, until this version,
+ *    PROMPT TEXT ONLY (system-prompt bullets Claude has to remember and
+ *    comply with on its own, same as every other CRITICAL rule) - there was
+ *    no nameLocked/phoneLocked flag or verification function anywhere in
+ *    the code. That gap is exactly why the name kept drifting even after
+ *    v36 added stronger prompt examples for it - a prompt rule alone is the
+ *    same class of fix that already failed once for the street name before
+ *    v37's code-level backstop. This version closes that gap for name and
+ *    phone the same way v37 closed it for the street.
+ *  - ALSO FOUND (not previously reported, found by re-reading the Address
+ *    Lock FSM's own checks while building this): checkAddressBeforeLock()
+ *    only ever verified the house number and street NAME, never the city -
+ *    "Saddlebrook -> Battle Brook" would have sailed straight through that
+ *    gate unverified even with v37/v38 both in place. New cityLooksWrong()
+ *    closes this; checkAddressBeforeLock() now checks number, street name,
+ *    AND city before locking.
+ *  - ALSO FOUND: once a field passed its lock check, nothing stopped a
+ *    LATER turn's extraction from silently overwriting it again - the merge
+ *    step in converseAndExtract applied `if (ex.name) ...`,
+ *    `if (ex.addressStreet) ...` etc. unconditionally, every turn, with no
+ *    guard for "this field already passed verification, don't touch it
+ *    again." A locked field could still be clobbered by a later unverified
+ *    extraction and nothing would ever re-check it (checkAddressBeforeLock
+ *    returns null immediately once addressLocked is true, by design - that
+ *    IS the "never re-check once locked" behavior, which only works safely
+ *    if nothing else can change the field afterward either). Fixed by
+ *    guarding every locked field's merge with `&& !this.xLocked`.
+ *  - New nameLooksWrong()/checkNameBeforeLock() and this.nameLocked/
+ *    this.nameConfirmAttempts: same shape as the v37 Address Lock FSM -
+ *    verify once (reusing wasActuallySaid(), not a hand-typed banned-word
+ *    list - see nameLooksWrong()'s own comment for why), lock it, bounded
+ *    retries (targeted re-ask, then letter-by-letter spelling, then accept
+ *    unverified after 3 attempts rather than trap the caller).
+ *  - New phoneLooksWrong()/checkPhoneBeforeLock() and this.phoneLocked/
+ *    this.phoneConfirmAttempts: same shape again, for the phone number.
+ *    Lighter-weight than name/address (no real report of digit corruption
+ *    specifically) but gives the wrap gate below one consistent flag to
+ *    check for every identity-critical field.
+ *  - New explicit `const wrapAllowed = this.nameLocked && this.phoneLocked
+ *    && this.addressLocked;` in handleConversation, checked before the
+ *    wrap-confirmation gate can run at all - the literal, auditable
+ *    "wrap_allowed only if name_locked && phone_locked && address_locked"
+ *    condition asked for, rather than leaving it as an implicit consequence
+ *    of "we didn't return early above."
+ *  - The wrap-confirmation cancel branch (an ambiguous/correcting reply to
+ *    "Is that all correct?") now re-opens ALL THREE locks (name, phone,
+ *    address), not just address as in v38 - free text alone can't reliably
+ *    say which field the caller meant to correct, so the safe default
+ *    re-verifies all three fresh next turn. Costs nothing when nothing was
+ *    actually wrong (each check silently re-locks with no extra question);
+ *    catches it when something was.
+ *  - Did NOT do: a NATO-alphabet letter-by-letter speech parser, or a
+ *    hand-typed banned-homophone list - both were considered and dropped in
+ *    favor of reusing the already-proven wasActuallySaid() mechanism, which
+ *    generalizes to any substitution instead of only the ones anyone
+ *    thought to list, and needs no new parsing code.
+ *  - Did NOT touch: JSON output shape, the field names in collectedData,
+ *    hasRequiredData(), buildWrapUpLine(), isCallerClosing/
+ *    looksLikeCorrection, the v35 hang-up listen-window/post-goodbye
+ *    mechanism, ElevenLabs settings, the four protected Gather settings, or
+ *    any prompt CRITICAL block - no new prompt text this version either,
+ *    same as v38, per the same "code FSMs, not prompt essays" instruction.
  */
 
 const twilio = require('twilio');
@@ -1216,6 +1290,18 @@ class AuroraAgent {
     // switch tactics (letter-by-letter spelling), and after that we stop
     // blocking the call entirely rather than trap the caller forever.
     this.addressConfirmAttempts = 0;
+    // v39: NAME LOCK FSM and PHONE LOCK FSM - same idea as the v37 Address
+    // Lock FSM, applied to the two other identity-critical fields. Added
+    // after real calls kept showing the name drifting into a near-homophone
+    // (Saade -> Saadi) even with the v36 "Name lock (MUST)" prompt rule in
+    // place - that rule was prompt-only (Claude has to remember and comply
+    // on its own), the same class of gap the Address Lock FSM was built to
+    // close for the street name. See checkNameBeforeLock()/checkPhoneBeforeLock()
+    // below and the new wrapAllowed gate in handleConversation.
+    this.nameLocked = false;
+    this.nameConfirmAttempts = 0;
+    this.phoneLocked = false;
+    this.phoneConfirmAttempts = 0;
     // v38: true once the wrap-up has been read back as a question and we're
     // waiting for the caller's explicit yes - see the new wrap-confirmation
     // gate in handleConversation below. Nothing gets saved/texted/hung up
@@ -1320,18 +1406,33 @@ class AuroraAgent {
 
       const reply = sanitizeForSpeech(parsed.reply || '');
       const ex = parsed.extracted || {};
-      if (ex.name) this.collectedData.callerName = ex.name;
-      if (ex.phone) this.collectedData.callerPhone = ex.phone;
+      // v39: FREEZE ONCE LOCKED. Before this, a field that had already
+      // passed its lock check (name/address) could still be silently
+      // overwritten by a LATER turn's extraction - Claude re-emitting the
+      // name or address field with a different, unverified value would
+      // have clobbered the already-confirmed one with no check at all,
+      // since checkNameBeforeLock()/checkAddressBeforeLock() only run once
+      // per turn and skip entirely once locked (that's the whole point of
+      // "locked"). Guarding the merge itself is what actually makes the
+      // lock a lock: a locked field can only change again after its lock
+      // flag is explicitly cleared (see the wrap-confirmation cancel branch
+      // in handleConversation), never from extraction alone.
+      if (ex.name && !this.nameLocked) this.collectedData.callerName = ex.name;
+      if (ex.phone && !this.phoneLocked) this.collectedData.callerPhone = ex.phone;
       if (ex.email) this.collectedData.callerEmail = ex.email;
       if (ex.serviceType) this.collectedData.serviceType = ex.serviceType;
       if (ex.urgencyLevel) this.collectedData.urgencyLevel = ex.urgencyLevel;
       if (ex.description) this.collectedData.issueDescription = ex.description;
       // v15: each address piece is merged independently, so a new piece
       // (e.g. city) never wipes out a piece learned earlier (e.g. street).
-      if (ex.addressStreet) this.collectedData.propertyAddressStreet = ex.addressStreet;
-      if (ex.addressCity) this.collectedData.propertyAddressCity = ex.addressCity;
-      if (ex.addressState) this.collectedData.propertyAddressState = ex.addressState;
-      if (ex.addressZip) this.collectedData.propertyAddressZip = ex.addressZip;
+      // v39: also frozen once addressLocked, same reasoning as name/phone
+      // above - this is what stops a later turn from silently rewriting a
+      // confirmed "Saddle Brook" into "Battle Brook" after the address was
+      // already locked.
+      if (ex.addressStreet && !this.addressLocked) this.collectedData.propertyAddressStreet = ex.addressStreet;
+      if (ex.addressCity && !this.addressLocked) this.collectedData.propertyAddressCity = ex.addressCity;
+      if (ex.addressState && !this.addressLocked) this.collectedData.propertyAddressState = ex.addressState;
+      if (ex.addressZip && !this.addressLocked) this.collectedData.propertyAddressZip = ex.addressZip;
 
       // Store just the natural reply in history (not the JSON wrapper) so
       // future turns read like a normal conversation.
@@ -1444,6 +1545,19 @@ class AuroraAgent {
     return !nameOnly.split(/\s+/).every(word => this.wasActuallySaid(word));
   }
 
+  // v39: same check as streetNameLooksWrong, applied to the CITY - added
+  // after a real call showed "Saddle Brook"/"Saddlebrook" silently becoming
+  // "Battle Brook" in the wrap-up. The v37 Address Lock FSM only ever
+  // checked the house number and street name, so a corrupted city sailed
+  // straight through unverified even with that gate in place - this closes
+  // that specific gap.
+  cityLooksWrong() {
+    const city = this.collectedData.propertyAddressCity;
+    if (!city) return false;
+    if (this.rawSpeechHeard.length === 0) return false;
+    return !city.trim().split(/\s+/).every(word => this.wasActuallySaid(word));
+  }
+
   // v37: the "Address Lock FSM" from Joseph's QA - verify the address
   // ONCE, lock it, then never ask about it again. Replaces the old
   // checkHouseNumberMismatch() call site with a combined gate that also
@@ -1465,8 +1579,12 @@ class AuroraAgent {
     if (this.addressLocked) return null; // already verified - never re-check or re-ask
     const numberWrong = this.houseNumberLooksWrong();
     const nameWrong = this.streetNameLooksWrong();
+    // v39: also check the city, not just the house number and street name
+    // - see cityLooksWrong()'s comment for the real "Battle Brook" report
+    // this closes.
+    const cityWrong = this.cityLooksWrong();
 
-    if (!numberWrong && !nameWrong) {
+    if (!numberWrong && !nameWrong && !cityWrong) {
       this.addressLocked = true;
       return null;
     }
@@ -1478,16 +1596,18 @@ class AuroraAgent {
       // fallback, and it's still not resolving - accept what we have and
       // move on rather than loop forever. Logged clearly so this is
       // visible in Render logs if it ever fires on a real call.
-      console.warn(`⚠️ Address lock gate gave up after ${this.addressConfirmAttempts} attempts - accepting "${this.collectedData.propertyAddressStreet}" unverified to avoid trapping the caller.`);
+      console.warn(`⚠️ Address lock gate gave up after ${this.addressConfirmAttempts} attempts - accepting "${this.getFullAddress()}" unverified to avoid trapping the caller.`);
       this.addressLocked = true;
       return null;
     }
 
     if (this.addressConfirmAttempts === 1) {
-      if (numberWrong && nameWrong) {
+      if (numberWrong && (nameWrong || cityWrong)) {
         return "Before I lock this in - can you say the full street address one more time for me, nice and slow?";
       } else if (numberWrong) {
         return "Before I lock this in - can you say the house number for me one more time, just the numbers?";
+      } else if (cityWrong && !nameWrong) {
+        return "I want to make sure I have the city exactly right - can you say just the city one more time for me?";
       } else {
         return "I want to make sure I have the street name exactly right - can you say just the street name one more time for me?";
       }
@@ -1496,7 +1616,85 @@ class AuroraAgent {
     // Second miss: switch tactics instead of repeating the same question -
     // ask for a letter-by-letter spelling, same technique already used for
     // last names.
+    if (cityWrong && !nameWrong && !numberWrong) {
+      return "I want to get this exactly right - can you spell the city for me, one clear letter at a time, like S as in Sam?";
+    }
     return "I want to get this exactly right - can you spell the street name for me, one clear letter at a time, like S as in Sam?";
+  }
+
+  // v39: NAME LOCK FSM - the code-level counterpart to the "Name lock
+  // (MUST)" prompt rule above. That rule is prompt-only (Claude has to
+  // remember and comply on its own turn after turn), and real calls kept
+  // showing exactly the failure it was meant to prevent: the confirmed last
+  // name silently drifting into a near-homophone (Saade -> Saadi) in
+  // Claude's own later extraction. Deliberately reuses wasActuallySaid()
+  // instead of a hand-typed banned-word list (Saadi/Seed/Saeed/Sadi/Sayed/
+  // Saudi...) - a hand list can never be complete, while checking whether
+  // the name actually appears anywhere in what the caller said (or spelled
+  // - wasActuallySaid already strips spaces so bare-letter/NATO spelling
+  // still matches) catches any substitution the same way, not just the
+  // ones anyone thought to list.
+  nameLooksWrong() {
+    const name = this.collectedData.callerName;
+    if (!name) return false;
+    if (this.rawSpeechHeard.length === 0) return false; // nothing to check against yet
+    return !name.trim().split(/\s+/).every(word => this.wasActuallySaid(word));
+  }
+
+  // Same shape as checkAddressBeforeLock(): verify once, lock it, bounded
+  // retries (targeted re-ask, then letter-by-letter spelling, then accept
+  // unverified rather than trap the caller in a loop).
+  checkNameBeforeLock() {
+    if (this.nameLocked) return null;
+    if (!this.collectedData.callerName) return null; // nothing to check yet
+    if (!this.nameLooksWrong()) {
+      this.nameLocked = true;
+      return null;
+    }
+    this.nameConfirmAttempts++;
+    if (this.nameConfirmAttempts >= 3) {
+      console.warn(`⚠️ Name lock gate gave up after ${this.nameConfirmAttempts} attempts - accepting "${this.collectedData.callerName}" unverified to avoid trapping the caller.`);
+      this.nameLocked = true;
+      return null;
+    }
+    if (this.nameConfirmAttempts === 1) {
+      return "I want to make sure I have your name exactly right - can you say your full name for me one more time?";
+    }
+    return "Let's spell it out to be sure - can you spell your full name for me, one clear letter at a time, like S as in Sam?";
+  }
+
+  // v39: PHONE LOCK FSM - lighter-weight than the name/address checks (no
+  // real call report has shown digit corruption the way the name/address
+  // homophone drift has), added so the wrapAllowed gate below has one
+  // consistent locked flag for every identity-critical field instead of
+  // trusting hasRequiredData() (which only checks a field is non-empty,
+  // never that it was actually verified) for phone specifically. Cross-
+  // checks the phone number's digits appear somewhere in what the caller
+  // actually said, same spirit as houseNumberLooksWrong.
+  phoneLooksWrong() {
+    const phone = this.collectedData.callerPhone;
+    if (!phone) return false;
+    const digitsOnly = phone.replace(/\D/g, '');
+    if (!digitsOnly) return false;
+    if (this.rawDigitsHeard.length === 0) return false; // nothing to cross-check yet
+    const joinedDigits = this.rawDigitsHeard.join('');
+    return !joinedDigits.includes(digitsOnly) && !this.rawDigitsHeard.includes(digitsOnly);
+  }
+
+  checkPhoneBeforeLock() {
+    if (this.phoneLocked) return null;
+    if (!this.collectedData.callerPhone) return null;
+    if (!this.phoneLooksWrong()) {
+      this.phoneLocked = true;
+      return null;
+    }
+    this.phoneConfirmAttempts++;
+    if (this.phoneConfirmAttempts >= 3) {
+      console.warn(`⚠️ Phone lock gate gave up after ${this.phoneConfirmAttempts} attempts - accepting "${this.collectedData.callerPhone}" unverified to avoid trapping the caller.`);
+      this.phoneLocked = true;
+      return null;
+    }
+    return "I want to double check your callback number - can you read it back to me one more time, one digit at a time?";
   }
 
   // v24: readable label per service, used only for the code-generated
@@ -1726,6 +1924,27 @@ class AuroraAgent {
   }
 
   async handleConversation(userMessage) {
+    // v39: if we're mid wrap-confirmation, decide BEFORE calling
+    // converseAndExtract whether this turn's reply is a clean, uncorrected
+    // "yes" - and if it's NOT, reopen all three locks right now, before
+    // extraction runs. isAffirmative()/looksLikeCorrection() are pure text
+    // checks on userMessage, no extraction needed, so this can run first.
+    // Ordering matters: converseAndExtract's merge step is guarded by
+    // `!this.xLocked` (freeze-once-locked, see its own comment) - if the
+    // locks were still true (last turn's state) while THIS turn's own
+    // corrected extraction gets merged, the correction would be silently
+    // frozen out one turn too late, the same turn it was supposed to take
+    // effect. Reopening here first is what lets a correction's own
+    // extraction actually land.
+    if (this.wrapConfirmationPending) {
+      const cleanYes = AuroraAgent.isAffirmative(userMessage) && !AuroraAgent.looksLikeCorrection(userMessage);
+      if (!cleanYes) {
+        this.nameLocked = false;
+        this.phoneLocked = false;
+        this.addressLocked = false;
+      }
+    }
+
     let response = await this.converseAndExtract(userMessage);
 
     if (!response || !response.trim()) {
@@ -1743,15 +1962,42 @@ class AuroraAgent {
         return this.collectingDataReply(response);
       }
 
-      // v24/v37: sanity-check the address (house number AND street name)
-      // before trusting it enough to save/text it out. If it doesn't check
-      // out, ask instead of saving - this replaces Claude's own turn reply
-      // with a direct clarifying question for this turn only. v37: bounded
-      // and now also checks the street name, not just the number - see
-      // checkAddressBeforeLock() above.
+      // v39: run all three identity-critical lock checks, in order - name
+      // first (everything Amy says out loud uses it), then phone, then the
+      // v37/v39 Address Lock FSM (house number, street name, AND city - see
+      // checkAddressBeforeLock() above). Ask about whichever ONE fails
+      // first; never stack more than one correction into a single turn.
+      // This replaces Claude's own turn reply with a direct clarifying
+      // question for this turn only when something doesn't check out.
+      const nameQuestion = this.checkNameBeforeLock();
+      if (nameQuestion) {
+        return this.collectingDataReply(nameQuestion);
+      }
+      const phoneQuestion = this.checkPhoneBeforeLock();
+      if (phoneQuestion) {
+        return this.collectingDataReply(phoneQuestion);
+      }
       const mismatchQuestion = this.checkAddressBeforeLock();
       if (mismatchQuestion) {
         return this.collectingDataReply(mismatchQuestion);
+      }
+
+      // v39: WRAP ALLOWED GATE - explicit, single source of truth for
+      // whether the call may enter/stay in wrap-confirmation, finalize,
+      // save, text, or hang up. True only once name, phone, AND address
+      // have each independently passed their own lock check (immediately
+      // above, this same turn) - never based on hasRequiredData() alone,
+      // since hasRequiredData() only checks that a field is non-empty, not
+      // that it was actually verified against what the caller said. By the
+      // time execution reaches here, all three checks above already ran
+      // and returned null (nothing to ask), so this is normally true - it
+      // exists as an explicit, auditable flag rather than an implicit
+      // side-effect of "we didn't return early above."
+      const wrapAllowed = this.nameLocked && this.phoneLocked && this.addressLocked;
+      if (!wrapAllowed) {
+        // Defensive only - should be unreachable given the three checks
+        // above, but never finalize/wrap without it.
+        return this.collectingDataReply(response);
       }
 
       // v38: WRAP-CONFIRMATION GATE. Before v38, the instant all required
@@ -1782,22 +2028,31 @@ class AuroraAgent {
         }
         // Anything else - an explicit correction, a plain restatement of a
         // field with no trigger word ("It's Sylvan Street"), a side
-        // question, an unclear reply - do NOT finalize. Cancel the pending
-        // confirmation and re-open the address for verification, so a
-        // restated value gets checked fresh against what was actually said
-        // (checkAddressBeforeLock) instead of being stuck on whatever was
-        // locked before. Claude's own reply this turn (from
-        // converseAndExtract above) already handles acknowledging/fixing/
-        // answering per the prompt rules - just speak it (through the same
-        // no-dead-turn guard) and stay in the conversation instead of
-        // hanging up.
+        // question, an unclear reply - do NOT finalize. All THREE locks
+        // (name, phone, address) were already reopened at the very top of
+        // handleConversation, before converseAndExtract ran, specifically
+        // so this turn's own corrected extraction (if any) could actually
+        // land instead of being frozen out by the old lock - see that
+        // comment for why the ordering matters. v39: we can't reliably
+        // tell from free text which field the caller meant to correct, so
+        // the safe default is reopening all three and letting each re-
+        // verify fresh next turn. In the common case nothing was actually
+        // wrong, so each check above silently re-locks with zero extra
+        // questions; if something genuinely was wrong, the relevant check
+        // catches it and asks. Same asymmetric-cost reasoning as the rest
+        // of this gate: one extra silent re-check costs nothing, a false
+        // finalize is what actually hurts. Claude's own reply this turn
+        // (from converseAndExtract above) already handles acknowledging/
+        // fixing/answering per the prompt rules - just speak it (through
+        // the same no-dead-turn guard) and stay in the conversation
+        // instead of hanging up. Just cancel the pending confirmation
+        // itself here - the locks are already handled.
         this.wrapConfirmationPending = false;
-        this.addressLocked = false;
         return this.collectingDataReply(response);
       }
 
-      // First time everything required is present and address-verified -
-      // read the wrap-up back as a question and wait for a yes, instead of
+      // First time everything required is present and verified - read the
+      // wrap-up back as a question and wait for a yes, instead of
       // finalizing immediately. buildWrapUpLine() still builds entirely
       // from collectedData (not whatever Claude free-formed this turn) -
       // this is what stops an invented word or a wrong city from ever
@@ -2012,7 +2267,7 @@ app.use(express.urlencoded({ extended: false }));
 app.get('/', (req, res) => {
   res.json({
     status: 'Aurora Voice Agent LIVE',
-    version: '38.0.0',
+    version: '39.0.0',
     timestamp: new Date().toISOString()
   });
 });
