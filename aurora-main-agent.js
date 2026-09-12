@@ -1558,6 +1558,25 @@ class AuroraAgent {
     return !city.trim().split(/\s+/).every(word => this.wasActuallySaid(word));
   }
 
+  // v40: same idea as houseNumberLooksWrong/phoneLooksWrong, applied to the
+  // ZIP CODE - found by code inspection, not a real-call report (unlike
+  // the number/street/city gaps above). checkAddressBeforeLock() (v37/v39)
+  // verified the house number, street name, and city before locking, but
+  // never the zip - so a misheard or invented zip could sail straight
+  // through with NO verification at all, the exact same failure mode the
+  // Address Lock FSM exists to close. Uses the joined-digits technique
+  // from phoneLooksWrong() (a zip is spoken as digits, not letters, so
+  // wasActuallySaid()'s word-based check doesn't apply here).
+  zipLooksWrong() {
+    const zip = this.collectedData.propertyAddressZip;
+    if (!zip) return false;
+    const digitsOnly = zip.replace(/\D/g, '');
+    if (!digitsOnly) return false;
+    if (this.rawDigitsHeard.length === 0) return false; // nothing to cross-check yet
+    const joinedDigits = this.rawDigitsHeard.join('');
+    return !joinedDigits.includes(digitsOnly) && !this.rawDigitsHeard.includes(digitsOnly);
+  }
+
   // v37: the "Address Lock FSM" from Joseph's QA - verify the address
   // ONCE, lock it, then never ask about it again. Replaces the old
   // checkHouseNumberMismatch() call site with a combined gate that also
@@ -1583,8 +1602,11 @@ class AuroraAgent {
     // - see cityLooksWrong()'s comment for the real "Battle Brook" report
     // this closes.
     const cityWrong = this.cityLooksWrong();
+    // v40: also check the zip - see zipLooksWrong()'s comment for the gap
+    // this closes (found by inspection: zip was never verified at all).
+    const zipWrong = this.zipLooksWrong();
 
-    if (!numberWrong && !nameWrong && !cityWrong) {
+    if (!numberWrong && !nameWrong && !cityWrong && !zipWrong) {
       this.addressLocked = true;
       return null;
     }
@@ -1592,20 +1614,22 @@ class AuroraAgent {
     this.addressConfirmAttempts++;
 
     if (this.addressConfirmAttempts >= 3) {
-      // Bounded fallback: we tried a targeted re-ask, then a spelling
-      // fallback, and it's still not resolving - accept what we have and
-      // move on rather than loop forever. Logged clearly so this is
-      // visible in Render logs if it ever fires on a real call.
+      // Bounded fallback: we tried a targeted re-ask, then a spelling/
+      // digit-by-digit fallback, and it's still not resolving - accept
+      // what we have and move on rather than loop forever. Logged clearly
+      // so this is visible in Render logs if it ever fires on a real call.
       console.warn(`⚠️ Address lock gate gave up after ${this.addressConfirmAttempts} attempts - accepting "${this.getFullAddress()}" unverified to avoid trapping the caller.`);
       this.addressLocked = true;
       return null;
     }
 
     if (this.addressConfirmAttempts === 1) {
-      if (numberWrong && (nameWrong || cityWrong)) {
+      if (numberWrong && (nameWrong || cityWrong || zipWrong)) {
         return "Before I lock this in - can you say the full street address one more time for me, nice and slow?";
       } else if (numberWrong) {
         return "Before I lock this in - can you say the house number for me one more time, just the numbers?";
+      } else if (zipWrong && !nameWrong && !cityWrong) {
+        return "I want to make sure I have the zip code exactly right - can you say just the zip code for me one more time, one digit at a time?";
       } else if (cityWrong && !nameWrong) {
         return "I want to make sure I have the city exactly right - can you say just the city one more time for me?";
       } else {
@@ -1614,8 +1638,11 @@ class AuroraAgent {
     }
 
     // Second miss: switch tactics instead of repeating the same question -
-    // ask for a letter-by-letter spelling, same technique already used for
-    // last names.
+    // ask for a letter-by-letter spelling (or digit-by-digit for the zip),
+    // same technique already used for last names.
+    if (zipWrong && !cityWrong && !nameWrong && !numberWrong) {
+      return "I want to get this exactly right - can you read me the zip code one digit at a time?";
+    }
     if (cityWrong && !nameWrong && !numberWrong) {
       return "I want to get this exactly right - can you spell the city for me, one clear letter at a time, like S as in Sam?";
     }
@@ -1829,6 +1856,42 @@ class AuroraAgent {
     return null;
   }
 
+  // v40: NO-RE-ASK GUARD - code-level backstop for the "CRITICAL - NO
+  // RE-ASK" prompt rule (applies to every field), which has never had one
+  // before now. That rule is prompt-only - Claude has to remember and
+  // comply on its own turn after turn - and a real call showed exactly the
+  // failure it's meant to prevent: Amy asked for the caller's phone number
+  // again right after they'd already given it, making the caller repeat
+  // something Amy already had. Same shape as the other bounded regex
+  // backstops in this file (isCallerClosing, looksLikeCorrection,
+  // holdsSubmission) - a plain keyword/phrase check, not true intent
+  // understanding, meant to catch the common case rather than every
+  // possible one. Deliberately narrow phrasing per field to keep false
+  // positives rare (see looksLikeReAsk for why a correction turn skips
+  // this entirely).
+  static REASK_PATTERNS = {
+    callerName: /\b(your (full )?name|who am i speaking (with|to)|can i get your name)\b/i,
+    callerPhone: /\b(phone number|call(ing)? you back|best number|reach you at|callback number)\b/i,
+    propertyAddressStreet: /\b(street address|what'?s the address|where (this|it) is happening)\b/i,
+    propertyAddressCity: /\bwhat city\b/i,
+    propertyAddressState: /\bwhat state\b/i,
+    propertyAddressZip: /\b(zip code|postal code)\b/i
+  };
+
+  // Returns the field name if this turn's reply looks like it's asking for
+  // a field we already have collected, or null otherwise. Only meaningful
+  // for Claude's own free-form reply text (the code-generated lock/wrap
+  // questions elsewhere never go through this).
+  looksLikeReAsk(reply) {
+    if (!reply) return null;
+    for (const [field, pattern] of Object.entries(AuroraAgent.REASK_PATTERNS)) {
+      if (this.collectedData[field] && pattern.test(reply)) {
+        return field;
+      }
+    }
+    return null;
+  }
+
   async determineRouting() {
     const urgency = this.collectedData.urgencyLevel;
     const service = this.collectedData.serviceType;
@@ -1949,6 +2012,22 @@ class AuroraAgent {
 
     if (!response || !response.trim()) {
       response = "I'm sorry, could you say that one more time for me?";
+    }
+
+    // v40: NO-RE-ASK GUARD - if this turn's free-form reply looks like it's
+    // asking for a field we already have, bridge to the next actually-
+    // missing question instead of letting the redundant question reach the
+    // caller. Skipped on a correction turn (looksLikeCorrection) since the
+    // caller correcting a field is exactly when Amy legitimately needs to
+    // talk about that field again. See looksLikeReAsk()/REASK_PATTERNS
+    // above for the real call this closes.
+    if (!AuroraAgent.looksLikeCorrection(userMessage)) {
+      const reaskedField = this.looksLikeReAsk(response);
+      if (reaskedField) {
+        console.warn(`⚠️ No-re-ask guard caught Amy re-asking for "${reaskedField}", which was already collected this call - bridging to the next question instead.`);
+        const bridgeQuestion = this.nextMissingFieldQuestion();
+        response = bridgeQuestion ? `Got it, thank you. ${bridgeQuestion}` : "Got it, thank you.";
+      }
     }
 
     if (this.hasRequiredData()) {
