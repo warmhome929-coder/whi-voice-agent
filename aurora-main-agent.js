@@ -826,6 +826,62 @@ const GATHER_SPEECH_HINTS = [
   'Sam', 'Apple', 'David', 'Edward'
 ].join(', ');
 
+// v45: END-OF-SPEECH TIMING - per Joseph's spec: "set end-of-speech VAD to
+// 700 to 900 milliseconds so Amy feels instant, but only trigger goodbye
+// when there's a clear long pause plus no audio after a complete utterance.
+// Never cut off mid-sentence or after a short thinking pause." Two things
+// worth flagging up front, both confirmed against Twilio's own <Gather>
+// docs before touching anything:
+//   1. Twilio's speechTimeout attribute only accepts a whole-number of
+//      SECONDS or the literal string "auto" - there is no millisecond or
+//      sub-second control exposed anywhere in the Gather API, so a literal
+//      700-900ms value isn't something Twilio lets us set. The closest
+//      real value is a flat 1 second (GATHER_SPEECH_TIMEOUT below).
+//   2. This project's four Gathers have used speechTimeout: 'auto' since
+//      the start - and Twilio's own docs describe 'auto' as "stops
+//      recognizing speech at the FIRST pause in speech." That's actually
+//      MORE aggressive than 700-900ms, not less - 'auto' is almost
+//      certainly the real cause of any mid-sentence/thinking-pause cutoff,
+//      since it doesn't wait for any grace period at all. Moving to a flat
+//      1-second value is a small, deliberate trade: very slightly less
+//      "instant" than the literal ask, in exchange for actually giving a
+//      caller room for a short "um" before Twilio decides they're done -
+//      which is the more important half of what was asked for.
+// This is a genuine, explicit change to speechTimeout - one of the four
+// Gather settings this file has treated as "never touch" since v33 (see
+// GATHER_SPEECH_HINTS above) - done ONLY because Joseph explicitly asked
+// for exactly this change here. numDigits/timeout(30s)/input remain
+// untouched; only speechTimeout changes on the two main conversational
+// Gathers.
+// ============================================
+// PROTECTED VOICE-TIMING CONFIG - DO NOT REMOVE ON AGENT SWAP
+// v46: Joseph asked explicitly that this block be marked non-negotiable so
+// a future refactor/agent swap/rewrite can't silently drop it. Both values
+// encode a real production requirement, not an arbitrary default - if this
+// file is ever rewritten or replaced, these two lines must be carried
+// forward unchanged (or re-derived from this same reasoning), not reset to
+// Twilio's plain defaults ('auto' speechTimeout, a shorter goodbye window).
+// ============================================
+const GATHER_SPEECH_TIMEOUT = 1;
+
+// v45: GOODBYE PACING - the second half of the spec: the actual decision to
+// hang up should require a clearly longer pause than an ordinary mid-
+// conversation turn, not just any pause after a closing-sounding phrase.
+// This project already never hangs up on a pause alone - isCallerClosing()
+// only fires on recognizable closing WORDS (not silence), and even then
+// Amy speaks her goodbye line and opens one more short listen-window
+// (originally 2s) before actually disconnecting, specifically so a caller
+// who's still mid-thought can jump back in. This widens that one window
+// (both places it's used - the ready-to-route hangup and the isCallerClosing
+// hangup) from 2s to 3s, so "a clear long pause plus no audio after a
+// complete utterance" - not just any 2-second gap - is what it takes before
+// the call actually ends. The main 30-second silence-timeout (nobody speaking
+// at all) is a different thing entirely and is untouched.
+const GOODBYE_LISTEN_WINDOW = 3;
+// ============================================
+// END PROTECTED VOICE-TIMING CONFIG
+// ============================================
+
 // ============================================
 // AURORA SYSTEM PROMPT
 // ============================================
@@ -1650,6 +1706,27 @@ class AuroraAgent {
     return !joinedDigits.includes(digitsOnly) && !this.rawDigitsHeard.includes(digitsOnly);
   }
 
+  // ============================================
+  // PROTECTED NAME/ADDRESS ACCURACY LOGIC - DO NOT REMOVE ON AGENT SWAP
+  // v46: Joseph asked for a Sylvan/Silver-specific spell-back rule ("when
+  // caller says Sylvan or Silver, spell it back and wait for yes"). This is
+  // already what checkAddressBeforeLock()/checkNameBeforeLock()/
+  // checkPhoneBeforeLock() below do - and deliberately for ANY value the
+  // caller gives, not those two words specifically. A hardcoded "if it's
+  // Sylvan or Silver" rule was NOT added on top, on purpose: those two
+  // words only matter because they're the ones that already caused a real
+  // mix-up on this account - the next misheard word (a different street, a
+  // different last name) would sail straight through a two-word special
+  // case with zero protection. wasActuallySaid()/nameLooksWrong()/
+  // streetNameLooksWrong() (v37/v39) were deliberately built as a GENERAL
+  // check (does the value actually appear in what the caller said) instead
+  // of a hand-typed banned-word list, specifically because a list can never
+  // be complete - see wasActuallySaid()'s own original comment for why.
+  // This whole region (through checkPhoneBeforeLock() and
+  // handleRawCorrection() further below) is the actual mechanism this
+  // protects - it must survive any future agent swap/rewrite unchanged.
+  // ============================================
+
   // v37: the "Address Lock FSM" from Joseph's QA - verify the address
   // ONCE, lock it, then never ask about it again. Replaces the old
   // checkHouseNumberMismatch() call site with a combined gate that also
@@ -2032,6 +2109,9 @@ class AuroraAgent {
     const q = `Let me confirm your address - ${this.digitsOut(houseNumber)} ${this.spellOut(streetNameOnly)}, ${propertyAddressCity}${statePart}, ${this.digitsOut(propertyAddressZip)}. Is that correct?`;
     return this.collectingDataReply(q, { userMessage, claudeRawReply: null, decisions });
   }
+  // ============================================
+  // END PROTECTED NAME/ADDRESS ACCURACY LOGIC
+  // ============================================
 
   // v24: readable label per service, used only for the code-generated
   // wrap-up line below - keeps the final summary honest instead of
@@ -2514,6 +2594,10 @@ class AuroraAgent {
     // yet, and only replaces with data we already trust.
     response = this.substituteCorrectSurname(response);
 
+    // PROTECTED - DO NOT REMOVE ON AGENT SWAP (v46): the three calls below
+    // are what actually ENFORCES the protected name/address accuracy logic
+    // above - removing or bypassing this call site would silently disable
+    // it even if the check methods themselves are left intact.
     // v42: UNIVERSAL LOCK GATE - per Joseph's spec: "Claude only extracts
     // and replies, period" - the router (this code), not Claude, decides
     // whether a wrap-up/goodbye is allowed to fire. Before v42, checkName/
@@ -2695,7 +2779,11 @@ exports.handleCall = async (req, res) => {
     const gather = twiml.gather({
       numDigits: 0,
       timeout: 30,
-      speechTimeout: 'auto',
+      // v45: explicit change (per Joseph's spec) from 'auto' (Twilio's
+      // "stop at the first pause" mode) to a flat 1 second - see
+      // GATHER_SPEECH_TIMEOUT's own comment above for why. numDigits/
+      // timeout(30s)/input are still untouched.
+      speechTimeout: GATHER_SPEECH_TIMEOUT,
       input: 'speech',
       action: '/voice/gather-response',
       hints: GATHER_SPEECH_HINTS, // v33: additive only, the four settings above are untouched
@@ -2771,8 +2859,12 @@ exports.handleGatherResponse = async (req, res) => {
       // below always relied on.
       twiml.gather({
         numDigits: 0,
-        timeout: 2,
-        speechTimeout: 'auto',
+        // v45: widened from 2s to 3s (GOODBYE_LISTEN_WINDOW) - per Joseph's
+        // spec, actually hanging up should wait for "a clear long pause...
+        // after a complete utterance," not just any short gap. See that
+        // constant's own comment above.
+        timeout: GOODBYE_LISTEN_WINDOW,
+        speechTimeout: GATHER_SPEECH_TIMEOUT,
         input: 'speech',
         action: '/voice/post-goodbye',
         hints: GATHER_SPEECH_HINTS,
@@ -2801,8 +2893,10 @@ exports.handleGatherResponse = async (req, res) => {
       // ready_to_route branch above.
       twiml.gather({
         numDigits: 0,
-        timeout: 2,
-        speechTimeout: 'auto',
+        // v45: widened from 2s to 3s (GOODBYE_LISTEN_WINDOW) - same reason
+        // as the ready_to_route branch above.
+        timeout: GOODBYE_LISTEN_WINDOW,
+        speechTimeout: GATHER_SPEECH_TIMEOUT,
         input: 'speech',
         action: '/voice/post-goodbye',
         hints: GATHER_SPEECH_HINTS,
@@ -2816,7 +2910,9 @@ exports.handleGatherResponse = async (req, res) => {
       const gather = twiml.gather({
         numDigits: 0,
         timeout: 30,
-        speechTimeout: 'auto',
+        // v45: explicit change from 'auto' to a flat 1 second - see
+        // GATHER_SPEECH_TIMEOUT's comment near the top of the file.
+        speechTimeout: GATHER_SPEECH_TIMEOUT,
         input: 'speech',
         action: '/voice/gather-response',
         hints: GATHER_SPEECH_HINTS, // v33: additive only, the four settings above are untouched
