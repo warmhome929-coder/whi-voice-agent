@@ -2191,50 +2191,63 @@ class AuroraAgent {
           correctedText = [...words.slice(0, splitPoint), consolidated].join(' ').trim();
         }
       }
-      if (correctedText && correctedText.trim().split(/\s+/).length === 1 && this.collectedData.callerName) {
+      // v54 fix: on a SECOND (or later) correction in the same spell-pending
+      // exchange, the most recently corrected value lives in
+      // this.callerNameRaw, not collectedData (which still holds the stale,
+      // not-yet-confirmed original until a lock happens). Preferring
+      // collectedData here meant a follow-up turn with no new name content
+      // (e.g. the caller just addresses the agent by name with nothing
+      // else) could silently revert an already-good correction back to the
+      // stale value - the same class of bug traced and fixed for address,
+      // below, from a real call.
+      const priorName = this.callerNameRaw || this.collectedData.callerName;
+      if (correctedText && correctedText.trim().split(/\s+/).length === 1 && priorName) {
         // The common real case: the caller only restated the LAST name
         // (e.g. "actually it's Saade, not Saadi") - keep the existing
         // first name, replace only the last name, so a last-name-only
         // correction doesn't silently drop the first name entirely.
-        const existingFirst = this.collectedData.callerName.trim().split(/\s+/).slice(0, -1).join(' ');
+        const existingFirst = priorName.trim().split(/\s+/).slice(0, -1).join(' ');
         this.callerNameRaw = existingFirst ? `${existingFirst} ${correctedText}` : correctedText;
       } else {
-        this.callerNameRaw = correctedText || this.collectedData.callerName;
+        this.callerNameRaw = correctedText || priorName;
       }
       decisions.push('raw-correction-name');
-      if (this.nameRawCorrectionAttempts >= 3) {
-        console.warn(`⚠️ Name raw-correction gate gave up after ${this.nameRawCorrectionAttempts} corrections - locking "${this.callerNameRaw}" as given to avoid trapping the caller.`);
-        this.collectedData.callerName = this.callerNameRaw;
-        this.callerNameRaw = null;
-        this.nameRawCorrectionAttempts = 0;
-        this.nameSpellPending = false;
-        this.nameLocked = true;
-        return this.collectingDataReply("Got it, thank you.", { userMessage, claudeRawReply: null, decisions });
-      }
+      // v54: NEVER force-lock an unconfirmed raw correction, however many
+      // attempts it takes - same "keep asking, never lock on a timer"
+      // principle v53 already applies to ambiguous spell-confirm replies.
+      // A real Sept 13 call showed this exact fallback (the OLD >= 3
+      // force-lock below) lock in a corrupted value ("6456 Amy Street")
+      // after 3 failed correction attempts, where the actual root cause was
+      // a stripCorrectionFiller bug feeding it garbage - the counter
+      // reaching 3 never meant the value was actually right. Escalate
+      // wording instead of ever accepting an unverified value on a timer.
       this.nameSpellPending = true;
       const parts = this.callerNameRaw.trim().split(/\s+/);
       const last = parts[parts.length - 1];
       const first = parts.slice(0, -1).join(' ');
-      const q = `Let me make sure I have your name exactly right - ${first ? first + ' ' : ''}${this.spellOut(last)}. Is that correct?`;
+      const spelledName = `${first ? first + ' ' : ''}${this.spellOut(last)}`;
+      const q = this.nameRawCorrectionAttempts >= 3
+        ? `Let's slow down - ${spelledName}. Just say "yes" if that's right, or spell out the correct name for me one letter at a time.`
+        : `Let me make sure I have your name exactly right - ${spelledName}. Is that correct?`;
       return this.collectingDataReply(q, { userMessage, claudeRawReply: null, decisions });
     }
 
     if (field === 'phone') {
       this.phoneRawCorrectionAttempts++;
       const digits = (userMessage.match(/\d+/g) || []).join('');
-      this.callerPhoneRaw = digits || this.collectedData.callerPhone;
+      // v54 fix: prefer the last pending correction (this.callerPhoneRaw)
+      // over the stale collectedData value when this turn has no digits at
+      // all - same class of bug fixed for name/address, below, from a real
+      // call: a no-new-content reply on a later correction attempt must not
+      // silently revert an already-good pending correction.
+      this.callerPhoneRaw = digits || this.callerPhoneRaw || this.collectedData.callerPhone;
       decisions.push('raw-correction-phone');
-      if (this.phoneRawCorrectionAttempts >= 3) {
-        console.warn(`⚠️ Phone raw-correction gate gave up after ${this.phoneRawCorrectionAttempts} corrections - locking "${this.callerPhoneRaw}" as given to avoid trapping the caller.`);
-        this.collectedData.callerPhone = this.callerPhoneRaw;
-        this.callerPhoneRaw = null;
-        this.phoneRawCorrectionAttempts = 0;
-        this.phoneSpellPending = false;
-        this.phoneLocked = true;
-        return this.collectingDataReply("Got it, thank you.", { userMessage, claudeRawReply: null, decisions });
-      }
+      // v54: same never-force-lock principle as name, above.
       this.phoneSpellPending = true;
-      const q = `Let me confirm your callback number - ${this.digitsOutPhone(this.callerPhoneRaw)}. Is that correct?`;
+      const phoneReadback = this.digitsOutPhone(this.callerPhoneRaw);
+      const q = this.phoneRawCorrectionAttempts >= 3
+        ? `Let's slow down - ${phoneReadback}. Just say "yes" if that's right, or read me the correct number one digit at a time.`
+        : `Let me confirm your callback number - ${phoneReadback}. Is that correct?`;
       return this.collectingDataReply(q, { userMessage, claudeRawReply: null, decisions });
     }
 
@@ -2245,7 +2258,17 @@ class AuroraAgent {
     // go through the normal wrongness-check escalation, which already
     // has its own spell-it-out step for those.
     this.addressRawCorrectionAttempts++;
-    const existingStreet = this.collectedData.propertyAddressStreet || '';
+    // v54 fix: when this is a SECOND (or later) correction attempt in the
+    // same spell-pending exchange, the most recently corrected value lives
+    // in addressStreetRaw, not in collectedData (which still holds the
+    // stale, not-yet-confirmed original until a lock happens). Reading only
+    // collectedData here meant a follow-up turn with no new street content
+    // (e.g. the caller just says "no" again, or addresses the agent by
+    // name with nothing else) silently REVERTED an already-good correction
+    // back to the original wrong value instead of preserving it - traced
+    // directly from a real call where turn 14 correctly fixed the house
+    // number, then turn 15 ("No Amy, that's not correct.") undid it.
+    const existingStreet = this.addressStreetRaw || this.collectedData.propertyAddressStreet || '';
     const suffixRe = /\b(street|st|road|rd|avenue|ave|drive|dr|lane|ln|court|ct|way|boulevard|blvd|place|pl|circle|cir)\.?\s*$/i;
     const suffixMatch = existingStreet.match(suffixRe);
     const suffix = suffixMatch ? ' ' + suffixMatch[0] : '';
@@ -2269,23 +2292,31 @@ class AuroraAgent {
     if (knownCity) scoped = scoped.replace(new RegExp(`\\b${escapeRe(knownCity)}\\b\\s*,?\\s*$`, 'i'), '').trim();
     const rawMatch = scoped.match(/^\s*(\d+)?\s*(.*)$/);
     const houseNumber = (rawMatch && rawMatch[1]) || (existingStreet.match(/^(\d+)/) || [])[1] || '';
-    let streetNameOnly = ((rawMatch && rawMatch[2]) || scoped).replace(suffixRe, '').trim();
+    // v54 fix: a bare house-number-only correction ("its 456 not 6456") now
+    // that stripCorrectionFiller correctly extracts JUST "456" - leaves
+    // rawMatch[2] as a legitimately EMPTY string (no street text was said).
+    // The old `(rawMatch[2] || scoped)` treated that empty-but-correct
+    // match as falsy and fell back to `scoped` (still "456"), producing
+    // "456 456 Street" - duplicating the house number into the street name
+    // instead of preserving it. Use rawMatch[2] directly (it always exists,
+    // even if empty) so an intentionally-empty remainder correctly falls
+    // through to the existing-street-name fallback on the next line.
+    let streetNameOnly = (rawMatch ? rawMatch[2] : scoped).replace(suffixRe, '').trim();
     streetNameOnly = AuroraAgent.titleCase(streetNameOnly) || existingStreet.replace(/^\d+\s*/, '').replace(suffixRe, '').trim();
     this.addressStreetRaw = `${houseNumber ? houseNumber + ' ' : ''}${streetNameOnly}${suffix}`.trim();
     decisions.push('raw-correction-address');
     const { propertyAddressCity, propertyAddressState, propertyAddressZip } = this.collectedData;
     const statePart = propertyAddressState ? `, ${propertyAddressState}` : '';
-    if (this.addressRawCorrectionAttempts >= 3) {
-      console.warn(`⚠️ Address raw-correction gate gave up after ${this.addressRawCorrectionAttempts} corrections - locking "${this.addressStreetRaw}" as given to avoid trapping the caller.`);
-      this.collectedData.propertyAddressStreet = this.addressStreetRaw;
-      this.addressStreetRaw = null;
-      this.addressRawCorrectionAttempts = 0;
-      this.addressSpellPending = false;
-      this.addressLocked = true;
-      return this.collectingDataReply("Got it, thank you.", { userMessage, claudeRawReply: null, decisions });
-    }
+    // v54: same never-force-lock principle as name/phone, above - this is
+    // the exact fallback that fired in the real Sept 13 call and locked in
+    // "6456 Amy Street" (the agent's own name, leaked in by a
+    // stripCorrectionFiller bug, misread as street-name content). Escalate
+    // wording instead of ever accepting an unverified value on a timer.
     this.addressSpellPending = true;
-    const q = `Let me confirm your address - ${this.digitsOut(houseNumber)} ${this.spellOut(streetNameOnly)}, ${propertyAddressCity}${statePart}, ${this.digitsOut(propertyAddressZip)}. Is that correct?`;
+    const addressReadback = `${this.digitsOut(houseNumber)} ${this.spellOut(streetNameOnly)}, ${propertyAddressCity}${statePart}, ${this.digitsOut(propertyAddressZip)}`;
+    const q = this.addressRawCorrectionAttempts >= 3
+      ? `Let's slow down - ${addressReadback}. Just say "yes" if that's right, or tell me exactly what's wrong with it.`
+      : `Let me confirm your address - ${addressReadback}. Is that correct?`;
     return this.collectingDataReply(q, { userMessage, claudeRawReply: null, decisions });
   }
   // ============================================
@@ -2418,14 +2449,39 @@ class AuroraAgent {
   // straight from the caller's words, per the spec: "overwrite the _raw
   // field immediately with the caller's exact spelling... never call
   // Claude or rephrase between correction and spell-back."
+  // v54: a real Sept 13 call (post-v53) showed two compounding failures in
+  // the ORIGINAL single-whole-message version of this function:
+  //   (a) "It's not correct.  Its 456 not 6456." - the caller's actual new
+  //       value ("456") sits in a SECOND sentence, after a first sentence
+  //       that itself contains "not". A single regex cutting from the
+  //       first/only "not" it finds can only handle one of two opposite
+  //       sentence shapes at a time ("X, not Y" - keep X, drop trailing
+  //       "not Y" - vs "It's not. Z" - drop the leading "...not", keep
+  //       trailing Z) - so it silently dropped the caller's real correction.
+  //   (b) "No Amy, that's not correct." - the caller addressing the agent
+  //       by name (vocatively) survived every filler pattern and was
+  //       captured as if it were real content, which then fed into the
+  //       address field and got force-locked as fake street-name data
+  //       ("6456 Amy Street") by the addressRawCorrectionAttempts >= 3
+  //       fallback a few turns later.
+  // Fix: split on sentence boundaries first and apply the not-clause strip
+  // PER SENTENCE independently (correctly handles both shapes above, since
+  // each sentence only ever has its own "not" to worry about), and strip
+  // the agent's own name/alternate names (vocative address, not content)
+  // before anything else runs.
   static stripCorrectionFiller(text) {
     if (!text) return '';
-    return text
-      // A "...X, not Y" correction states the NEW value (X) before the
-      // disclaimer - cut the trailing "not <old value>" clause off first
-      // so it isn't left dangling in what we keep.
-      .replace(/,?\s*\bnot\s+.*$/i, '')
-      .replace(/\b(actually|no,?\s*(it|that)('?s| is) (not|wrong|incorrect)|(it|that)('?s| is) (not|wrong|incorrect)|(it|that)('?s| is) actually|still wrong|i said|correction|let me correct|meant to say|i misspoke|(it|that)('?s| is)|no,?|wrong|my name is|the (name|number|phone|street|address) is)\b/gi, ' ')
+    const agentNames = [AURORA_CONFIG.aurora.name, ...(AURORA_CONFIG.aurora.alternateNames || [])];
+    const nameStripped = agentNames.reduce(
+      (acc, n) => acc.replace(new RegExp(`\\b${n}\\b`, 'gi'), ' '),
+      text
+    );
+    const sentenceStripped = nameStripped
+      .split(/[.!?]+/)
+      .map(sentence => sentence.replace(/,?\s*\bnot\s+.*$/i, ''))
+      .join(' ');
+    return sentenceStripped
+      .replace(/\b(actually|no,?\s*(it|that)('?s| is) (not|wrong|incorrect)|(it|that)('?s| is) (not|wrong|incorrect)|(it|that)('?s| is) actually|still wrong|i said|correction|let me correct|meant to say|i misspoke|(it|that)('?s| is)|no,?|wrong|correct|incorrect|my name is|the (name|number|phone|street|address) is)\b/gi, ' ')
       .replace(/[.,!?]+/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
