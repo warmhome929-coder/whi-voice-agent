@@ -1935,7 +1935,7 @@ class AuroraAgent {
       // it verbatim rarely helps - ask for an explicit yes/no and invite
       // the caller to say what's wrong, instead of the identical sentence.
       if (this.addressSpellAttempts >= 2) {
-        return `Let's slow down - ${readback}. Just say "yes" if that's right, or tell me exactly what's wrong with it.`;
+        return `I want to make sure I have this exactly right - ${readback}. Does that look correct, or is there something you'd like me to change?`;
       }
       return `Let me confirm your address - ${readback}. Is that correct?`;
     }
@@ -2102,7 +2102,7 @@ class AuroraAgent {
     // rarely helps - ask for an explicit yes/no and offer the letter-by-
     // letter alternative instead.
     if (this.nameSpellAttempts >= 2) {
-      return `Let's slow down - ${spelledName}. Just say "yes" if that's right, or spell out the correct name for me one letter at a time.`;
+      return `I want to make sure I have this exactly right - ${spelledName}. Does that look correct, or is there something you'd like me to change? You're welcome to spell it out for me if that's easier.`;
     }
     return `Let me make sure I have your name exactly right - ${spelledName}. Is that correct?`;
   }
@@ -2190,7 +2190,7 @@ class AuroraAgent {
     // rarely helps - ask for an explicit yes/no and offer the digit-by-
     // digit alternative instead.
     if (this.phoneSpellAttempts >= 2) {
-      return `Let's slow down - ${phoneReadback}. Just say "yes" if that's right, or read me the correct number one digit at a time.`;
+      return `I want to make sure I have this exactly right - ${phoneReadback}. Does that look correct, or is there something you'd like me to change? You're welcome to read it back to me one digit at a time if that's easier.`;
     }
     return `Let me confirm your callback number - ${phoneReadback}. Is that correct?`;
   }
@@ -2272,7 +2272,7 @@ class AuroraAgent {
       const first = parts.slice(0, -1).join(' ');
       const spelledName = `${first ? first + ' ' : ''}${this.spellOut(last)}`;
       const q = this.nameRawCorrectionAttempts >= 3
-        ? `Let's slow down - ${spelledName}. Just say "yes" if that's right, or spell out the correct name for me one letter at a time.`
+        ? `I want to make sure I have this exactly right - ${spelledName}. Does that look correct, or is there something you'd like me to change? You're welcome to spell it out for me if that's easier.`
         : `Let me make sure I have your name exactly right - ${spelledName}. Is that correct?`;
       return this.collectingDataReply(q, { userMessage, claudeRawReply: null, decisions });
     }
@@ -2291,7 +2291,7 @@ class AuroraAgent {
       this.phoneSpellPending = true;
       const phoneReadback = this.digitsOutPhone(this.callerPhoneRaw);
       const q = this.phoneRawCorrectionAttempts >= 3
-        ? `Let's slow down - ${phoneReadback}. Just say "yes" if that's right, or read me the correct number one digit at a time.`
+        ? `I want to make sure I have this exactly right - ${phoneReadback}. Does that look correct, or is there something you'd like me to change? You're welcome to read it back to me one digit at a time if that's easier.`
         : `Let me confirm your callback number - ${phoneReadback}. Is that correct?`;
       return this.collectingDataReply(q, { userMessage, claudeRawReply: null, decisions });
     }
@@ -2335,18 +2335,30 @@ class AuroraAgent {
     if (knownZip) scoped = scoped.replace(new RegExp(`\\b${escapeRe(knownZip)}\\b\\s*,?\\s*$`, 'i'), '').trim();
     if (knownState) scoped = scoped.replace(new RegExp(`\\b${escapeRe(knownState)}\\b\\s*,?\\s*$`, 'i'), '').trim();
     if (knownCity) scoped = scoped.replace(new RegExp(`\\b${escapeRe(knownCity)}\\b\\s*,?\\s*$`, 'i'), '').trim();
-    const rawMatch = scoped.match(/^\s*(\d+)?\s*(.*)$/);
-    const houseNumber = (rawMatch && rawMatch[1]) || (existingStreet.match(/^(\d+)/) || [])[1] || '';
+    // v58: search for the house number ANYWHERE in the scoped text, not
+    // just at position 0. The old `^\s*(\d+)?...` anchor assumed
+    // stripCorrectionFiller always leaves the digits at the very start -
+    // true most of the time, but a real call showed leftover filler text
+    // ("the address is 456 Silvin") can still precede the digits when
+    // stripCorrectionFiller doesn't recognize a given phrasing. Rather than
+    // trust that anchor, find the digits wherever they are and treat
+    // everything else as the street text - robust to whatever filler slips
+    // through, instead of one more enumerated phrase to catch.
+    const numMatch = scoped.match(/\d+/);
+    const houseNumber = (numMatch && numMatch[0]) || (existingStreet.match(/^(\d+)/) || [])[1] || '';
     // v54 fix: a bare house-number-only correction ("its 456 not 6456") now
-    // that stripCorrectionFiller correctly extracts JUST "456" - leaves
-    // rawMatch[2] as a legitimately EMPTY string (no street text was said).
-    // The old `(rawMatch[2] || scoped)` treated that empty-but-correct
-    // match as falsy and fell back to `scoped` (still "456"), producing
-    // "456 456 Street" - duplicating the house number into the street name
-    // instead of preserving it. Use rawMatch[2] directly (it always exists,
-    // even if empty) so an intentionally-empty remainder correctly falls
-    // through to the existing-street-name fallback on the next line.
-    let streetNameOnly = (rawMatch ? rawMatch[2] : scoped).replace(suffixRe, '').trim();
+    // that stripCorrectionFiller correctly extracts JUST "456" - leaves the
+    // remainder as a legitimately EMPTY string (no street text was said).
+    // Treating that empty-but-correct remainder as falsy and falling back
+    // to `scoped` (still "456") produced "456 456 Street" - duplicating the
+    // house number into the street name instead of preserving it. Compute
+    // the remainder directly (it's correctly empty when there's nothing
+    // left) so an intentionally-empty remainder falls through to the
+    // existing-street-name fallback on the next line.
+    const remainder = numMatch
+      ? (scoped.slice(0, numMatch.index) + ' ' + scoped.slice(numMatch.index + numMatch[0].length))
+      : scoped;
+    let streetNameOnly = remainder.replace(suffixRe, '').trim();
     // v55: a caller spelling the street name letter by letter ("s y l v a
     // n") left each letter as its own word here - see
     // consolidateSpelledLetters()'s comment for the real call that showed
@@ -2366,7 +2378,7 @@ class AuroraAgent {
     this.addressSpellPending = true;
     const addressReadback = `${this.digitsOut(houseNumber)} ${this.spellOut(streetNameOnly)}, ${propertyAddressCity}${statePart}, ${this.digitsOut(propertyAddressZip)}`;
     const q = this.addressRawCorrectionAttempts >= 3
-      ? `Let's slow down - ${addressReadback}. Just say "yes" if that's right, or tell me exactly what's wrong with it.`
+      ? `I want to make sure I have this exactly right - ${addressReadback}. Does that look correct, or is there something you'd like me to change?`
       : `Let me confirm your address - ${addressReadback}. Is that correct?`;
     return this.collectingDataReply(q, { userMessage, claudeRawReply: null, decisions });
   }
@@ -2531,11 +2543,27 @@ class AuroraAgent {
       .split(/[.!?]+/)
       .map(sentence => sentence.replace(/,?\s*\bnot\s+.*$/i, ''))
       .join(' ');
-    return sentenceStripped
+    const wordFiltered = sentenceStripped
       .replace(/\b(actually|no,?\s*(it|that)('?s| is) (not|wrong|incorrect)|(it|that)('?s| is) (not|wrong|incorrect)|(it|that)('?s| is) actually|still wrong|i said|correction|let me correct|meant to say|i misspoke|(it|that)('?s| is)|no,?|wrong|correct|incorrect|my name is|the (name|number|phone|street|address) is)\b/gi, ' ')
       .replace(/[.,!?]+/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
+    // v58: a real Sept 13 call (post-v54/v55/v56) showed the enumerated "the
+    // (name|number|phone|street|address) is" alternative above is too rigid
+    // - it only matches when "the" is IMMEDIATELY followed by the field
+    // word. A caller saying "the CORRECT address is 456 Silvin" (extremely
+    // common phrasing) broke the match, leaving "the address is" as literal
+    // text glued onto the captured street name - which then made the house
+    // number extraction miss the digits entirely (see the address branch
+    // below) and spellOut() silently concatenated the leftover words into
+    // one unbroken run ("THEADDRESSISSILVIN"). Rather than enumerate every
+    // possible adjective a caller might insert ("correct", "actual",
+    // "real", "right", ...) - the same word-list fragility already flagged
+    // as an anti-pattern for this project (v46) - generally strip ANY
+    // leading "the ... is" preamble, whatever sits in between. Anchored to
+    // the very start of the fully-cleaned text (never mid-sentence), so it
+    // only ever removes an actual preamble, never real content.
+    return wordFiltered.replace(/^\s*the\s+.*?\bis\b\s*/i, '');
   }
 
   // v55 (extracted from v48's name-only version): a caller spelling a word
