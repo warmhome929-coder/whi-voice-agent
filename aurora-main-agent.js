@@ -757,7 +757,7 @@ const AURORA_CONFIG = {
   voice: {
     elevenlabs: {
       apiKey: process.env.ELEVENLABS_API_KEY,
-      voiceId: 'OYTbf65OHHFELVut7v2H', // v20: Joseph's chosen voice from ElevenLabs' Voice Library
+      voiceId: 'sE5nsoE8d5l4jHZqnzmP', // v57: Joseph's chosen replacement voice from ElevenLabs' Voice Library
       modelId: 'eleven_turbo_v2_5',
       // v6 tried stability 0.35 + speed 0.92 together to fix "too fast/flat" -
       // that combo made her sound slurred and sleepy instead. Reverted then.
