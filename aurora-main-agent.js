@@ -862,7 +862,14 @@ const GATHER_SPEECH_HINTS = [
 // forward unchanged (or re-derived from this same reasoning), not reset to
 // Twilio's plain defaults ('auto' speechTimeout, a shorter goodbye window).
 // ============================================
-const GATHER_SPEECH_TIMEOUT = 1;
+// v52 DELIBERATE UPDATE (per Joseph's real-call investigation): raised from
+// 1 to 2 seconds. v50's investigation found real Render TURN_LOG evidence
+// of Twilio cutting a caller off mid-sentence at the 1s mark - "It's Joseph
+// Saade, S-A-A-D-E" arrived as just "It's Joseph.", with the rest of the
+// sentence never heard at all. 1s was closer to 'auto' than intended. 2s is
+// still far snappier than Twilio's own defaults, and is a deliberate trade-off
+// (very slightly less "instant") made with the user, not a silent revert.
+const GATHER_SPEECH_TIMEOUT = 2;
 
 // v45: GOODBYE PACING - the second half of the spec: the actual decision to
 // hang up should require a clearly longer pause than an ordinary mid-
@@ -1614,10 +1621,16 @@ class AuroraAgent {
     const storedMatch = street.match(/^(\d+)/);
     if (!storedMatch) return false; // no leading number to check (unusual, but not our job to block on)
     const storedNumber = storedMatch[1];
-    // Nothing to cross-check against yet (e.g. Twilio's speech-to-text
-    // returned the number as words, not digits, somewhere) - don't block
-    // on a check we can't actually perform.
-    if (this.rawDigitsHeard.length === 0) return false;
+    // v53 ASR-TRUST HARDENING (per Joseph's spec): a stored house number
+    // with ZERO digit evidence anywhere in the whole call is not "nothing
+    // to check" - it means this value could only have gotten into
+    // collectedData without the caller ever actually saying any digits at
+    // all, i.e. Claude invented or hallucinated it. That must not pass as
+    // "fine" - treat it as looking wrong so the normal re-ask/spell-out
+    // escalation runs instead of silently accepting it. (Previously
+    // returned false/"not wrong" here, which let an unverifiable value
+    // sail straight through to spell-back-and-lock.)
+    if (this.rawDigitsHeard.length === 0) return true;
     return !this.rawDigitsHeard.includes(storedNumber);
   }
 
@@ -1684,7 +1697,12 @@ class AuroraAgent {
   streetNameLooksWrong() {
     const street = this.collectedData.propertyAddressStreet;
     if (!street) return false;
-    if (this.rawSpeechHeard.length === 0) return false; // nothing to check against
+    // v53 ASR-TRUST HARDENING (per Joseph's spec): zero speech evidence for
+    // the entire call while a street name is already on file means this
+    // value could not have come from anything the caller actually said -
+    // must not pass as verified. See houseNumberLooksWrong()'s matching
+    // v53 comment for the full reasoning (previously returned false here).
+    if (this.rawSpeechHeard.length === 0) return true;
     // Strip the leading house number and a trailing street-type word
     // (street/st/road/rd/avenue/ave/drive/dr/lane/ln/court/ct/way/
     // boulevard/blvd) to isolate just the NAME part, e.g. "456 Sylvan
@@ -1709,7 +1727,10 @@ class AuroraAgent {
   cityLooksWrong() {
     const city = this.collectedData.propertyAddressCity;
     if (!city) return false;
-    if (this.rawSpeechHeard.length === 0) return false;
+    // v53 ASR-TRUST HARDENING: same reasoning as houseNumberLooksWrong()'s
+    // matching v53 comment - zero speech evidence for the whole call must
+    // not pass a stored city as verified.
+    if (this.rawSpeechHeard.length === 0) return true;
     return !city.trim().split(/\s+/).every(word => this.wasActuallySaid(word));
   }
 
@@ -1727,7 +1748,10 @@ class AuroraAgent {
     if (!zip) return false;
     const digitsOnly = zip.replace(/\D/g, '');
     if (!digitsOnly) return false;
-    if (this.rawDigitsHeard.length === 0) return false; // nothing to cross-check yet
+    // v53 ASR-TRUST HARDENING: see houseNumberLooksWrong()'s matching v53
+    // comment - zero digit evidence for the whole call must not pass a
+    // stored zip as verified.
+    if (this.rawDigitsHeard.length === 0) return true;
     const joinedDigits = this.rawDigitsHeard.join('');
     return !joinedDigits.includes(digitsOnly) && !this.rawDigitsHeard.includes(digitsOnly);
   }
@@ -1810,16 +1834,26 @@ class AuroraAgent {
       // correct?" forever.
       this.addressSpellAttempts++;
       if (this.addressSpellAttempts >= 2 && !AuroraAgent.looksLikeCorrection(userMessage)) {
-        // v48: apply a pending raw street correction before giving up - see
-        // the matching fix in checkNameBeforeLock() above for why.
+        // v48: apply a pending raw street correction (more trustworthy
+        // than the original extraction) even though we're not locking -
+        // see the matching fix in checkNameBeforeLock() above for why.
         if (this.addressStreetRaw) {
           this.collectedData.propertyAddressStreet = this.addressStreetRaw;
           this.addressStreetRaw = null;
           this.addressRawCorrectionAttempts = 0;
         }
-        console.warn(`⚠️ Address spell-confirm gate gave up after ${this.addressSpellAttempts} ambiguous replies - accepting "${this.getFullAddress()}" to avoid trapping the caller.`);
-        this.addressLocked = true;
-        return null;
+        // v53 ASR-TRUST HARDENING (per Joseph's explicit spec): this used
+        // to force-lock whatever value was on file here just to end the
+        // loop. Per spec, an ambiguous (not a clear yes, not a recognized
+        // correction) reply to "is that correct?" must NEVER silently lock
+        // a value that was never actually confirmed - a wrong address
+        // locked in is worse than one more turn asking. Falls through
+        // below to re-ask, with escalated wording once attempts >= 2 (see
+        // the readback return further down). Deliberately unbounded here -
+        // the caller can still always just restate the whole address as a
+        // correction, which the handleRawCorrection() short-circuit above
+        // catches before this function is even called.
+        console.warn(`⚠️ Address spell-confirm reply #${this.addressSpellAttempts} was ambiguous (not a clear yes, not a recognized correction) - re-asking instead of locking (v53).`);
       }
     }
 
@@ -1845,7 +1879,14 @@ class AuroraAgent {
         .replace(/\b(street|st|road|rd|avenue|ave|drive|dr|lane|ln|court|ct|way|boulevard|blvd|place|pl|circle|cir)\.?\s*$/i, '')
         .trim();
       const statePart = propertyAddressState ? `, ${propertyAddressState}` : '';
-      return `Let me confirm your address - ${this.digitsOut(houseNumber)} ${this.spellOut(streetNameOnly)}, ${propertyAddressCity}${statePart}, ${this.digitsOut(propertyAddressZip)}. Is that correct?`;
+      const readback = `${this.digitsOut(houseNumber)} ${this.spellOut(streetNameOnly)}, ${propertyAddressCity}${statePart}, ${this.digitsOut(propertyAddressZip)}`;
+      // v53: after 2+ ambiguous replies to this exact question, repeating
+      // it verbatim rarely helps - ask for an explicit yes/no and invite
+      // the caller to say what's wrong, instead of the identical sentence.
+      if (this.addressSpellAttempts >= 2) {
+        return `Let's slow down - ${readback}. Just say "yes" if that's right, or tell me exactly what's wrong with it.`;
+      }
+      return `Let me confirm your address - ${readback}. Is that correct?`;
     }
 
     this.addressConfirmAttempts++;
@@ -1901,7 +1942,10 @@ class AuroraAgent {
   nameLooksWrong() {
     const name = this.collectedData.callerName;
     if (!name) return false;
-    if (this.rawSpeechHeard.length === 0) return false; // nothing to check against yet
+    // v53 ASR-TRUST HARDENING: see houseNumberLooksWrong()'s matching v53
+    // comment - zero speech evidence for the whole call must not pass a
+    // stored name as verified.
+    if (this.rawSpeechHeard.length === 0) return true;
     return !name.trim().split(/\s+/).every(word => this.wasActuallySaid(word));
   }
 
@@ -1966,19 +2010,20 @@ class AuroraAgent {
       this.nameSpellAttempts++;
       if (this.nameSpellAttempts >= 2 && !AuroraAgent.looksLikeCorrection(userMessage)) {
         // v48: apply a pending raw correction (if the caller gave one that
-        // never got a clean yes) before giving up - previously this locked
-        // whatever was ALREADY in collectedData and silently dropped
-        // callerNameRaw, discarding a correction the caller had actually
-        // given. See the matching fix in checkPhoneBeforeLock/
-        // checkAddressBeforeLock below.
+        // never got a clean yes) - more trustworthy than the original
+        // extraction even though we're not locking on it sight-unseen. See
+        // the matching fix in checkPhoneBeforeLock/checkAddressBeforeLock.
         if (this.callerNameRaw) {
           this.collectedData.callerName = this.callerNameRaw;
           this.callerNameRaw = null;
           this.nameRawCorrectionAttempts = 0;
         }
-        console.warn(`⚠️ Name spell-confirm gate gave up after ${this.nameSpellAttempts} ambiguous replies - accepting "${this.collectedData.callerName}" to avoid trapping the caller.`);
-        this.nameLocked = true;
-        return null;
+        // v53 ASR-TRUST HARDENING (per Joseph's explicit spec): this used
+        // to force-lock whatever value was on file here just to end the
+        // loop. An ambiguous reply must never silently lock an unconfirmed
+        // name - see the matching v53 comment in checkAddressBeforeLock()
+        // above for the full reasoning. Falls through to re-ask below.
+        console.warn(`⚠️ Name spell-confirm reply #${this.nameSpellAttempts} was ambiguous (not a clear yes, not a recognized correction) - re-asking instead of locking (v53).`);
       }
     }
 
@@ -2001,7 +2046,14 @@ class AuroraAgent {
     const parts = this.collectedData.callerName.trim().split(/\s+/);
     const last = parts[parts.length - 1];
     const first = parts.slice(0, -1).join(' ');
-    return `Let me make sure I have your name exactly right - ${first ? first + ' ' : ''}${this.spellOut(last)}. Is that correct?`;
+    const spelledName = `${first ? first + ' ' : ''}${this.spellOut(last)}`;
+    // v53: after 2+ ambiguous replies, repeating the identical question
+    // rarely helps - ask for an explicit yes/no and offer the letter-by-
+    // letter alternative instead.
+    if (this.nameSpellAttempts >= 2) {
+      return `Let's slow down - ${spelledName}. Just say "yes" if that's right, or spell out the correct name for me one letter at a time.`;
+    }
+    return `Let me make sure I have your name exactly right - ${spelledName}. Is that correct?`;
   }
 
   // v39: PHONE LOCK FSM - lighter-weight than the name/address checks (no
@@ -2017,7 +2069,10 @@ class AuroraAgent {
     if (!phone) return false;
     const digitsOnly = phone.replace(/\D/g, '');
     if (!digitsOnly) return false;
-    if (this.rawDigitsHeard.length === 0) return false; // nothing to cross-check yet
+    // v53 ASR-TRUST HARDENING: see houseNumberLooksWrong()'s matching v53
+    // comment - zero digit evidence for the whole call must not pass a
+    // stored phone number as verified.
+    if (this.rawDigitsHeard.length === 0) return true;
     const joinedDigits = this.rawDigitsHeard.join('');
     return !joinedDigits.includes(digitsOnly) && !this.rawDigitsHeard.includes(digitsOnly);
   }
@@ -2050,16 +2105,21 @@ class AuroraAgent {
       // the identical spelled-back question forever.
       this.phoneSpellAttempts++;
       if (this.phoneSpellAttempts >= 2 && !AuroraAgent.looksLikeCorrection(userMessage)) {
-        // v48: apply a pending raw digit correction before giving up - see
-        // the matching fix in checkNameBeforeLock() above for why.
+        // v48: apply a pending raw digit correction - more trustworthy
+        // than the original extraction even though we're not locking on
+        // it sight-unseen. See the matching fix in checkNameBeforeLock().
         if (this.callerPhoneRaw) {
           this.collectedData.callerPhone = this.callerPhoneRaw;
           this.callerPhoneRaw = null;
           this.phoneRawCorrectionAttempts = 0;
         }
-        console.warn(`⚠️ Phone spell-confirm gate gave up after ${this.phoneSpellAttempts} ambiguous replies - accepting "${this.collectedData.callerPhone}" to avoid trapping the caller.`);
-        this.phoneLocked = true;
-        return null;
+        // v53 ASR-TRUST HARDENING (per Joseph's explicit spec): this used
+        // to force-lock whatever value was on file here just to end the
+        // loop. An ambiguous reply must never silently lock an unconfirmed
+        // phone number - see the matching v53 comment in
+        // checkAddressBeforeLock() above for the full reasoning. Falls
+        // through to re-ask below.
+        console.warn(`⚠️ Phone spell-confirm reply #${this.phoneSpellAttempts} was ambiguous (not a clear yes, not a recognized correction) - re-asking instead of locking (v53).`);
       }
     }
 
@@ -2074,7 +2134,14 @@ class AuroraAgent {
     }
 
     this.phoneSpellPending = true;
-    return `Let me confirm your callback number - ${this.digitsOutPhone(this.collectedData.callerPhone)}. Is that correct?`;
+    const phoneReadback = this.digitsOutPhone(this.collectedData.callerPhone);
+    // v53: after 2+ ambiguous replies, repeating the identical question
+    // rarely helps - ask for an explicit yes/no and offer the digit-by-
+    // digit alternative instead.
+    if (this.phoneSpellAttempts >= 2) {
+      return `Let's slow down - ${phoneReadback}. Just say "yes" if that's right, or read me the correct number one digit at a time.`;
+    }
+    return `Let me confirm your callback number - ${phoneReadback}. Is that correct?`;
   }
 
   // v44: RAW CORRECTION CAPTURE - called from handleConversation() BEFORE
