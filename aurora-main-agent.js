@@ -1229,6 +1229,44 @@ function buildAudioUrl(req, id) {
   return `${req.protocol}://${req.get('host')}/audio/${id}.mp3`;
 }
 
+// v56 (latency fix): a real Render log showed EVERY normal conversation
+// turn - and the initial greeting - paying for TWO full ElevenLabs API
+// round-trips, sequentially awaited before the TwiML response could be
+// sent: the actual spoken reply, plus a second, hardcoded "It looks like
+// we got disconnected..." fallback line that TwiML only ever plays if the
+// caller stays completely silent through the whole Gather. That second
+// call is essentially always thrown away unheard, yet the log's own
+// "⏱️ ElevenLabs response time" lines showed it consistently costing an
+// extra ~300-400ms of pure, avoidable wait on top of every turn's real
+// latency (which is dominated by Claude's own ~2s response time - a
+// separate, much larger cost this cache does NOT and cannot touch).
+// Since this deployment's TTS voice/model/stability settings
+// (agent.config.voice.elevenlabs) are one single constant for the whole
+// service - never different per caller or per call - the exact same input
+// text always produces the exact same audio, so caching by exact text is
+// safe. Bounded (never unbounded, so this can't become a memory leak) -
+// evicts the oldest entry once the cap is hit. Populated automatically:
+// the recurring STATIC phrases (this disconnect line, the greeting, any
+// other fixed wording) end up cached after their first use for the life of
+// the process; one-off DYNAMIC text (a spelled-out name/address, which
+// varies almost every time) just never hits a repeat and costs nothing
+// beyond one Map lookup.
+const STATIC_AUDIO_CACHE_MAX = 50;
+const staticAudioCache = new Map(); // exact spoken text -> audio Buffer
+
+function getCachedAudio(text) {
+  return staticAudioCache.get(text) || null;
+}
+
+function setCachedAudio(text, buffer) {
+  if (staticAudioCache.has(text)) staticAudioCache.delete(text); // refresh recency
+  staticAudioCache.set(text, buffer);
+  if (staticAudioCache.size > STATIC_AUDIO_CACHE_MAX) {
+    const oldestKey = staticAudioCache.keys().next().value;
+    staticAudioCache.delete(oldestKey);
+  }
+}
+
 // ============================================
 // PER-CALL SESSION MEMORY
 // ============================================
@@ -1267,12 +1305,25 @@ async function speak(twimlNode, agent, text, req) {
       new Promise((_, reject) => setTimeout(() => reject(new Error('ElevenLabs timeout')), ms))
     ]);
 
+  // v56: skip the ElevenLabs round-trip entirely if this exact phrase has
+  // already been generated before this process's lifetime - see
+  // staticAudioCache's own comment above for why this is safe.
+  const cachedBuffer = getCachedAudio(cleanText);
+  if (cachedBuffer) {
+    const id = storeAudioClip(cachedBuffer);
+    const url = buildAudioUrl(req, id);
+    twimlNode.play(url);
+    console.log('✅ Speaking via ElevenLabs (cached, no API call):', url);
+    return;
+  }
+
   // v15: timed, same reason as the Claude call above - Render logs will
   // now show the actual ElevenLabs response time on every turn.
   const elevenStart = Date.now();
   try {
     const audioBuffer = await withTimeout(agent.textToSpeech(cleanText), elevenConfig.timeoutMs);
     console.log(`⏱️ ElevenLabs response time: ${Date.now() - elevenStart}ms`);
+    setCachedAudio(cleanText, audioBuffer);
     const id = storeAudioClip(audioBuffer);
     const url = buildAudioUrl(req, id);
     // No pause here: this plays a pre-rendered audio file, not a live
@@ -2179,17 +2230,11 @@ class AuroraAgent {
       // letters were kept as separate "name words," producing a nonsense
       // readback that spelled out only the very last letter (a real call
       // showed exactly this). Collapse a trailing run of 2+ consecutive
-      // single-letter tokens into one word before anything else runs.
+      // single-letter tokens into one word before anything else runs. (v55:
+      // this same collapse is now also applied to the address street name,
+      // below - see consolidateSpelledLetters().)
       if (correctedText) {
-        const words = correctedText.trim().split(/\s+/);
-        let splitPoint = words.length;
-        while (splitPoint > 0 && words[splitPoint - 1].length === 1) splitPoint--;
-        const letterRun = words.slice(splitPoint);
-        if (letterRun.length >= 2) {
-          const joined = letterRun.join('');
-          const consolidated = joined.charAt(0).toUpperCase() + joined.slice(1).toLowerCase();
-          correctedText = [...words.slice(0, splitPoint), consolidated].join(' ').trim();
-        }
+        correctedText = AuroraAgent.consolidateSpelledLetters(correctedText);
       }
       // v54 fix: on a SECOND (or later) correction in the same spell-pending
       // exchange, the most recently corrected value lives in
@@ -2302,6 +2347,12 @@ class AuroraAgent {
     // even if empty) so an intentionally-empty remainder correctly falls
     // through to the existing-street-name fallback on the next line.
     let streetNameOnly = (rawMatch ? rawMatch[2] : scoped).replace(suffixRe, '').trim();
+    // v55: a caller spelling the street name letter by letter ("s y l v a
+    // n") left each letter as its own word here - see
+    // consolidateSpelledLetters()'s comment for the real call that showed
+    // this producing "S Y L V A N" (spelled out as stray individual
+    // letters) instead of "Sylvan".
+    streetNameOnly = AuroraAgent.consolidateSpelledLetters(streetNameOnly);
     streetNameOnly = AuroraAgent.titleCase(streetNameOnly) || existingStreet.replace(/^\d+\s*/, '').replace(suffixRe, '').trim();
     this.addressStreetRaw = `${houseNumber ? houseNumber + ' ' : ''}${streetNameOnly}${suffix}`.trim();
     decisions.push('raw-correction-address');
@@ -2485,6 +2536,32 @@ class AuroraAgent {
       .replace(/[.,!?]+/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
+  }
+
+  // v55 (extracted from v48's name-only version): a caller spelling a word
+  // out letter by letter ("Sardi, s a g e" / spelling "s y l v a n") leaves
+  // each letter as a separate single-character "word" after
+  // stripCorrectionFiller's cleanup. Collapse a TRAILING run of 2+
+  // consecutive single-letter tokens into one consolidated word (everything
+  // before the run is left untouched) so the confirmation readback spells
+  // out one real word instead of a string of stray individual letters.
+  // Originally name-only (v48, from a real "Sardi, s a g e" call); a real
+  // Sept 13 call showed the exact same gap in the address branch - a
+  // spelled-out street name ("s y l v a n") was captured as the raw letters
+  // "S Y L V A N" glued onto other text instead of becoming "Sylvan" - so
+  // this is now shared by both the name and address raw-correction paths.
+  static consolidateSpelledLetters(text) {
+    if (!text) return text;
+    const words = text.trim().split(/\s+/);
+    let splitPoint = words.length;
+    while (splitPoint > 0 && words[splitPoint - 1].length === 1) splitPoint--;
+    const letterRun = words.slice(splitPoint);
+    if (letterRun.length >= 2) {
+      const joined = letterRun.join('');
+      const consolidated = joined.charAt(0).toUpperCase() + joined.slice(1).toLowerCase();
+      return [...words.slice(0, splitPoint), consolidated].join(' ').trim();
+    }
+    return text;
   }
 
   // v44: pure capitalization (not a semantic rewrite) - "sylvan street" ->
@@ -3490,4 +3567,9 @@ app.listen(PORT, () => {
   logKeyStatus();
 });
 
-module.exports = { AuroraAgent, app };
+// v56: speak() and the static-audio-cache helpers are exported alongside
+// AuroraAgent/app purely so the cache's behavior (the actual thing being
+// fixed) can be tested directly, the same way this project already tests
+// other pure/near-pure functions - not because anything outside this file
+// is meant to call them.
+module.exports = { AuroraAgent, app, speak, getCachedAudio, setCachedAudio };
