@@ -823,7 +823,28 @@ const GATHER_SPEECH_HINTS = [
   'India', 'Juliet', 'Kilo', 'Lima', 'Mike', 'November', 'Oscar', 'Papa',
   'Quebec', 'Romeo', 'Sierra', 'Tango', 'Uniform', 'Victor', 'Whiskey',
   'Xray', 'Yankee', 'Zulu',
-  'Sam', 'Apple', 'David', 'Edward'
+  'Sam', 'Apple', 'David', 'Edward',
+  // v60: address-vocabulary hints, added per an outside AI review Joseph
+  // asked to have checked against this week's real bugs. Every hard address
+  // failure this week (v48, v54, v55, v58) was Twilio's speech recognition
+  // itself mishearing a street name or number BEFORE any of this file's
+  // code ever saw it - text processing downstream can't fix a word Twilio
+  // never heard correctly in the first place. Twilio's Gather hints bias
+  // recognition toward an expected word list; this project had none for
+  // addresses, only company/service vocabulary, until now. Two groups:
+  // (1) common street-suffix words (same set the suffixRe regex already
+  // matches elsewhere in this file, for consistency) and the service-area
+  // state names (from the emergency-number list in Twilio: NY/CT/NJ/MA
+  // active, LA/TX/GA/FL pending transfer) - general, not overfit to one
+  // caller. (2) "Sylvan" and "Saddle Brook" specifically - not a random
+  // guess, but the single most repeatedly-misheard real street/city in
+  // every real call log traced this week (Sven, Silvin, Silver, a bare "s"
+  // - see v55's comment). Directly evidenced, not speculative.
+  'Street', 'Avenue', 'Road', 'Drive', 'Lane', 'Court', 'Way', 'Boulevard',
+  'Place', 'Circle',
+  'New York', 'Connecticut', 'New Jersey', 'Massachusetts', 'Louisiana',
+  'Texas', 'Georgia', 'Florida',
+  'Sylvan', 'Saddle Brook'
 ].join(', ');
 
 // v45: END-OF-SPEECH TIMING - per Joseph's spec: "set end-of-speech VAD to
