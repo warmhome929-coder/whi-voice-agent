@@ -2964,6 +2964,39 @@ class AuroraAgent {
     );
   }
 
+  // v51: converseAndExtract() pushes CLAUDE'S OWN proposed reply into
+  // conversationHistory the instant the API responds - BEFORE the router
+  // (collectingDataReply and the FINALIZED path below) ever gets a chance
+  // to override that reply, which is exactly what every BLOCKED-*-not-
+  // locked path, the v50 hostile-reply prefix, wrap-correction-cancelled,
+  // and FINALIZED all do. Once the router overrides a reply, Claude's own
+  // memory of "what it said" permanently diverges from what the caller
+  // actually heard - and on the very next turn, Claude reasons from that
+  // false memory. A real call minutes after v50 deployed showed exactly
+  // where this leads: v50's "block every turn until resolved" design means
+  // a caller can get blocked on the SAME field for several turns in a row,
+  // and each one compounds the drift - by turn 3, Claude's own history
+  // showed it asking about the property address (its real, un-overridden
+  // guess) instead of the last name the caller was actually asked for and
+  // had just spelled out, so Claude filed the spelled answer as a street
+  // name instead of a last name. The caller heard "And what's your last
+  // name?" on a loop with no way out ("You said what's my last name? 4
+  // times.").
+  // Fix: whenever this turn's actual spoken reply differs from what Claude
+  // proposed, overwrite the just-pushed history entry with reality - but
+  // only when it's certain to be the right entry (one exists, is the
+  // assistant's, and its content still matches claudeRawReply exactly).
+  // Never guess which entry to touch: a raw-correction turn (claudeRawReply
+  // is null - Claude was never consulted) or any mismatch leaves history
+  // untouched.
+  syncHistoryWithSpoken(actualReply, claudeRawReply) {
+    if (!claudeRawReply || actualReply === claudeRawReply) return;
+    const last = this.conversationHistory[this.conversationHistory.length - 1];
+    if (last && last.role === 'assistant' && last.content === claudeRawReply) {
+      last.content = actualReply;
+    }
+  }
+
   collectingDataReply(resp, logCtx = {}) {
     let out = resp;
     const nextQuestion = this.nextMissingFieldQuestion();
@@ -2979,6 +3012,10 @@ class AuroraAgent {
     } else if (!/\?\s*$/.test((out || '').trim())) {
       if (nextQuestion) out = `${out} ${nextQuestion}`.trim();
     }
+    // v51: keep conversationHistory in sync with what was ACTUALLY spoken -
+    // see syncHistoryWithSpoken()'s comment above for the real loop this
+    // closes.
+    this.syncHistoryWithSpoken(out, logCtx.claudeRawReply);
     const needsPause = AuroraAgent.needsPauseFor(logCtx.decisions);
     this.logTurn({ ...logCtx, finalReply: out, status: 'collecting_data' });
     return { response: out, status: 'collecting_data', dataCollected: this.collectedData, needsPause };
@@ -3191,6 +3228,10 @@ class AuroraAgent {
           await this.saveInquiryData();
           await this.sendSMSConfirmation();
           decisions.push('FINALIZED');
+          // v51: same history-sync fix as collectingDataReply() - the real
+          // closing line replaces Claude's pre-finalize free-text proposal
+          // in conversationHistory, not just in what's spoken.
+          this.syncHistoryWithSpoken(finalLine, claudeRawReply);
           this.logTurn({ userMessage, claudeRawReply, decisions, finalReply: finalLine, status: 'ready_to_route' });
           return {
             response: finalLine,
